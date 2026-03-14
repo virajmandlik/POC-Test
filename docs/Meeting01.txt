@@ -1,0 +1,73 @@
+Executive Summary — 09 Mar 2026
+Meeting Overview
+This meeting was an overview session between the Cisco hackathon team and representatives from Farmers for Forests (F4F) to clarify requirements and processes for two automation use cases related to farmer onboarding and document verification. The discussion included technical, operational, and data requirements, with several F4F team members and hackathon participants present. The meeting date was not specified.
+
+Executive Summary
+The primary objective is to automate manual document verification processes for farmer onboarding, focusing on land records and carbon credit training evidence.
+F4F currently supports smallholder farmers in India to transition to agroforestry, with the aim of generating and distributing carbon credits.
+Two main use cases: (1) Automated verification of photographic evidence for carbon credit training, (2) Automated extraction of structured data from land record documents using OCR.
+Current manual processes are a bottleneck for scale; automation is required to process large volumes efficiently and reduce errors and delays.
+Sample datasets (including synthetic data) will be provided for model training and validation; privacy and anonymisation are key considerations.
+Preferred technology stack for APIs is Python/FastAPI, but integration with existing PHP backend is possible; F4F is migrating to AWS.
+Key requirements include support for Hindi and Marathi (Devanagari script), flagging of low-quality/blurry documents at upload, and flexibility for future document types.
+F4F will provide prioritised field lists for extraction from land records if full extraction is not feasible.
+Next steps include sharing sample data, finalising requirements, and clarifying open questions before the hackathon commences next week.
+Key Discussion Points
+Context and Problem Definition
+F4F supports smallholder farmers in India with agroforestry, aiming to generate carbon credits and share revenue with farmers. The onboarding process involves collecting and verifying multiple documents, currently handled manually by a data quality team.
+
+Manual document checks are time-consuming and limit scalability.
+Verification includes eligibility for carbon credits and KYC (Know Your Customer) processes.
+Six key documents are collected per farmer; land records and photographic evidence are the focus for automation.
+Automation Use Cases
+Two automation use cases were detailed: (1) Verification of carbon credit training photos, and (2) Extraction of structured data from land records.
+
+Photo verification requires checking for both a farmer and F4F representative in the frame, geotag, timestamp, and other metadata.
+Land record extraction involves OCR of state-specific documents, with priority fields such as farmer name, location, and plot details.
+Flagging of blurry or low-quality documents at upload is critical to avoid delays and repeated field visits.
+Future extension to other document types (e.g., bank passbooks) is anticipated.
+Technical and Data Requirements
+The team discussed integration, technology preferences, and dataset availability.
+
+Preferred API implementation is in Python/FastAPI; existing backend is PHP, with migration to AWS underway.
+Sample datasets (including synthetic and anonymised data) will be shared for model development.
+Support for Hindi and Marathi (Devanagari script) is required for OCR tasks.
+Integration with F4F’s internal data collection app is planned; APIs should be modular and easily deployable.
+Operational Considerations
+The process for document upload and verification was clarified, along with privacy and field team workflow needs.
+
+Documents are uploaded via shared drives or mobile data collection apps (e.g., Kobo server).
+Immediate feedback on document quality at the point of upload is highly desirable.
+Privacy concerns may limit inclusion of certain documents (e.g., bank passbooks) in the pilot phase.
+F4F will handle backend integration and deployment post-API delivery.
+Decisions Made
+Confirmed: The automation pilot will focus on land records and carbon credit training photographic evidence. Other document types may be considered in future phases.
+Confirmed: APIs should be delivered in Python/FastAPI if possible, with modular design for integration.
+Confirmed: Sample datasets (anonymised/synthetic) will be provided by F4F for model training and validation.
+Tentative: Field list priorities for land record extraction will be shared if full extraction is not feasible (timing unknown).
+Tentative: Inclusion of bank passbooks and other sensitive documents is deferred pending privacy review (timing unknown).
+Action Items
+Action	Owner	Due Date	Priority	Notes
+Share anonymised/synthetic sample datasets for land records and training photos	Farmers for Forests	unknown	HIGH	Essential for model development; privacy to be ensured
+Provide prioritised field list for land record extraction	Farmers for Forests	unknown	MEDIUM	For use if full extraction is not feasible
+Clarify inclusion/exclusion of additional document types (e.g., bank passbooks)	Farmers for Forests	unknown	LOW	Dependent on privacy and anonymisation feasibility
+Confirm API integration requirements and endpoints	Cisco hackathon team	unknown	MEDIUM	Align with F4F backend/app infrastructure
+Submit any further questions to F4F via Kirtee Yadav or Alice	Cisco hackathon team	By hackathon start (unknown)	HIGH	To ensure all requirements are clarified pre-hackathon
+Insights & Observations
+The main operational bottleneck is manual document verification, which not only limits scale but also introduces delays and the risk of errors or repeated field visits. Automating quality checks at the point of upload (e.g., flagging blurry images) can significantly reduce operational friction and improve data quality.
+The requirement to support both Hindi and Marathi (Devanagari script) for OCR is critical, as these are the primary languages in F4F’s operating regions. Existing open-source OCR models (e.g., Tesseract with language packs, or modern LLM-based OCR frameworks) could be adapted for this use case.
+The flexibility to extend automation to additional document types (e.g., bank passbooks) and the modularity of the API design will future-proof the solution as F4F’s operations expand.
+Actionable idea: Consider a two-stage pipeline—first, a lightweight image quality classifier (possibly using a small CNN or LLM-based vision model) to flag poor-quality uploads, followed by a document-specific OCR/extraction module. This approach aligns with F4F’s workflow and minimises unnecessary manual intervention.
+Next Steps
+F4F to share sample datasets and prioritised field lists with the Cisco hackathon team as soon as possible.
+Hackathon team to review data, clarify any open questions, and confirm API/integration requirements prior to hackathon start.
+Develop initial prototypes for (1) image quality flagging, (2) document OCR and data extraction, targeting Python/FastAPI deployment.
+Schedule a follow-up meeting post-data sharing to review technical approach, address blockers, and align on deliverables.
+Assumptions & Limitations
+Meeting date and full attendee list were not specified; inferences are based on transcript context.
+Exact sample data delivery timelines and field list details are unknown as not specified in the meeting.
+Where document types or phases were ambiguous (e.g., inclusion of bank passbooks), these were marked as tentative or deferred per transcript statements.
+All technical recommendations are based on stated preferences for Python/FastAPI and current backend migration plans; no hard constraints were imposed by F4F.
+Transcript contained some unclear references to document types and process steps; where clarification was not possible, these were marked as unknown or omitted.
+No specific figures, deadlines, or commitments were fabricated; all ranges and priorities are as implied or stated in the source material.
+No contradictions were identified in the transcript; if future requirements diverge, explicit clarification from F4F will be needed.

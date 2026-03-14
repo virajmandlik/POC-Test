@@ -1,0 +1,1153 @@
+# DocExtract Pipeline — Project Implementation Plan
+
+## Multilingual Document Extraction System (Marathi | Hindi | English)
+
+| Field              | Value                                |
+|--------------------|--------------------------------------|
+| Version            | 1.1.0                                |
+| Last Updated       | March 11, 2026                       |
+| Project Status     | Phase 1 — In Progress                |
+| Document Type      | Living Document (update as work progresses) |
+
+---
+
+## Change Log
+
+| Date           | Version | Author | Change Description                                           |
+|----------------|---------|--------|--------------------------------------------------------------|
+| Mar 10, 2026   | 1.0.0   | Karan  | Initial plan drafted after F4F stakeholder meeting           |
+| Mar 11, 2026   | 1.1.0   | Karan  | Reformatted to standard; marked completed/in-progress items  |
+
+---
+
+## Table of Contents
+
+1. [Project Overview](#1-project-overview)
+2. [Stakeholder Context](#2-stakeholder-context)
+3. [Architecture](#3-architecture)
+4. [System Flow](#4-system-flow)
+5. [Phase-wise Implementation Plan](#5-phase-wise-implementation-plan)
+   - Phase 1: Foundation & Core Pipeline (Weeks 1-4)
+   - Phase 2: Intelligence & Optimization (Weeks 5-8)
+   - Phase 3: Scale & Custom Model (Weeks 9-12)
+6. [Component Specifications](#6-component-specifications)
+7. [API Contracts](#7-api-contracts)
+8. [JSON Output Schema](#8-json-output-schema)
+9. [Tech Stack](#9-tech-stack)
+10. [Scope of Improvement Log](#10-scope-of-improvement-log)
+11. [Risk Matrix](#11-risk-matrix)
+12. [Folder Structure](#12-folder-structure)
+13. [Quick Start](#13-quick-start)
+
+---
+
+## Status Legend
+
+| Symbol | Meaning        |
+|--------|----------------|
+| done   | Completed      |
+| prog   | In Progress    |
+| todo   | Not Started    |
+| block  | Blocked        |
+| defer  | Deferred       |
+
+---
+
+## 1. Project Overview
+
+### What Is This?
+
+A backend pipeline system that:
+
+- Ingests documents (PDF/Image) via `/ingress` API
+- Processes them through quality checks, OCR extraction (offline + online), and intelligent merging
+- Outputs structured JSON via `/egress` API
+
+### Who Uses It?
+
+- **Farmers** — upload documents, verify extracted personal/land data
+- **Government Officials** — verify, approve, and consume structured data
+- **Farmers for Forests (F4F)** — downstream consumer of structured land records for carbon credit programs
+
+### Core Requirements
+
+| Requirement          | Detail                                                  |
+|----------------------|---------------------------------------------------------|
+| Languages Supported  | Marathi, Hindi, English                                 |
+| Offline Capability   | Full pipeline must work without internet                |
+| Online Enhancement   | When network available, use GPT Vision + GPT-4o-mini    |
+| Output Format        | Structured JSON                                         |
+| Accuracy Target      | >90% for printed text, >75% for handwritten             |
+| Lightweight          | Offline model should be <500MB                          |
+| Primary Document     | Maharashtra 7/12 Land Record (gaav namuna saat)         |
+
+---
+
+## 2. Stakeholder Context
+
+Source: F4F Stakeholder Meeting (March 9, 2026)
+
+| Item                | Detail                                                   |
+|---------------------|----------------------------------------------------------|
+| Partner Org         | Farmers for Forests (F4F)                                |
+| Use Case 1          | Photo verification for carbon credit training attendance |
+| Use Case 2          | Land record extraction via OCR (primary focus)           |
+| Preferred Stack     | Python / FastAPI                                         |
+| Language Priority    | Marathi (primary), Hindi, English                        |
+| Deployment Context  | Rural India — intermittent connectivity                  |
+
+---
+
+## 3. Architecture
+
+```
+DATA IN --> PROCESSING PIPELINE --> JSON OUT
+```
+
+### High-Level Architecture
+
+```
++------------------------------------------------------------------+
+|                      DocExtract Pipeline                          |
++------------------------------------------------------------------+
+|                                                                    |
+|  +-----------+   +--------------------------------------+   +----------+
+|  |           |   |        PROCESSING ENGINE             |   |          |
+|  | /ingress  |-->|                                      |-->| /egress  |
+|  |   API     |   |  +--------+  +----------+  +------+ |   |   API    |
+|  |           |   |  | PRE-   |  |EXTRACTION|  | POST-| |   |          |
+|  | Accepts:  |   |  |PROCESS |->| ENGINE   |->|PROCESS||   | Returns: |
+|  | - PDF     |   |  |        |  |          |  |      | |   | - JSON   |
+|  | - Image   |   |  +--------+  +----------+  +------+ |   |          |
+|  +-----------+   |                                      |   +----------+
+|                  |  +----------------------------------+ |              |
+|                  |  | EXTRACTION ENGINE (Detail)       | |              |
+|                  |  |                                  | |              |
+|                  |  |  +-----------+  +-------------+  | |              |
+|                  |  |  | OFFLINE   |  | ONLINE      |  | |              |
+|                  |  |  | PaddleOCR |  | GPT Vision  |  | |              |
+|                  |  |  +-----------+  +-------------+  | |              |
+|                  |  |       |              |           | |              |
+|                  |  |       +------+-------+           | |              |
+|                  |  |              v                    | |              |
+|                  |  |    +------------------+          | |              |
+|                  |  |    | GPT-4o-mini      |          | |              |
+|                  |  |    | (Merge + Format) |          | |              |
+|                  |  |    +------------------+          | |              |
+|                  |  +----------------------------------+ |              |
+|                  |                                      |              |
+|                  |  +--------------+  +----------------+ |              |
+|                  |  | VERIFICATION |  | DATA STORE     | |              |
+|                  |  | (Human-in-   |  | - Audit Logs   | |              |
+|                  |  |  the-loop)   |  | - Training Data| |              |
+|                  |  +--------------+  +----------------+ |              |
+|                  +--------------------------------------+              |
++------------------------------------------------------------------+
+```
+
+### Extraction Routing Logic
+
+| Scenario     | What Happens                                                                          |
+|--------------|---------------------------------------------------------------------------------------|
+| Online       | PaddleOCR + GPT Vision run in parallel --> Both outputs merged via GPT-4o-mini        |
+| Offline      | Only PaddleOCR runs --> Output formatted directly into JSON                           |
+| GPT Timeout  | GPT Vision times out --> Fall back to PaddleOCR-only result (no pipeline block)       |
+
+---
+
+## 4. System Flow
+
+```
+START
+  |
+  v
++------------------------------+
+| /ingress API                 |
+|                              |
+| - Receive file (PDF/Image)   |
+| - Validate file type/size    |
+| - Assign document_id         |
+| - Capture metadata           |
+| - Store original file        |
++----------+-------------------+
+           |
+           v
++------------------------------+
+| PREPROCESSING                |
+|                              |
+| Step 1: PDF to Image         |
+|   (300 DPI using PyMuPDF)    |
+|                              |
+| Step 2: Image Enhancement    |
+|   - Deskew, Denoise          |
+|   - Binarize, Contrast       |
+|                              |
+| Step 3: Quality Analysis     |
+|   - Blur detection           |
+|   - Resolution check         |
+|   - Brightness check         |
++----------+-------------------+
+           |
+           v
++------------------+
+| Quality Pass?    |
+| score >= 0.6     |
++--------+---------+
+    |          |
+   PASS       FAIL --> Return quality report + request re-upload
+    |
+    v
++------------------------------+
+| LANGUAGE DETECTION           |
+| - Detect script              |
+| - Classify language          |
++----------+-------------------+
+           |
+           v
++------------------------------+
+| NETWORK CHECK                |
++--------+----------+----------+
+         |          |
+      ONLINE     OFFLINE
+         |          |
+         v          |
++------------------+|
+| DUAL EXTRACTION  ||
+| (Parallel)       ||
+|                  ||
+| +------++------+ ||
+| |Paddle||GPT   | ||
+| |OCR   ||Vision| ||
+| +--+---++--+---+ ||
+|    |       |     ||
+|    +---+---+     ||
+|        v         ||
+| +-------------+  ||
+| | GPT-4o-mini |  ||
+| | MERGE       |  ||
+| +------+------+  ||
++--------+---------+|
+         |          |
+         |          v
+         |  +------------------+
+         |  | OFFLINE          |
+         |  | EXTRACTION       |
+         |  | (PaddleOCR only) |
+         |  +--------+---------+
+         |           |
+         +-----+-----+
+               |
+               v
++------------------------------+
+| FORMATTING                   |
+| - Map to JSON schema         |
+| - Validate mandatory fields  |
+| - Add confidence metadata    |
++----------+-------------------+
+           |
+           v
++------------------------------+
+| VERIFICATION                 |
+|                              |
+| IF confidence >= 95%         |
+|   --> Auto-approve           |
+| ELSE                         |
+|   --> Human verification     |
+|   --> APPROVED or REJECTED   |
+|                              |
+| REJECTED:                    |
+|   retry_count <= 3 --> retry |
+|   retry_count > 3  --> manual|
++----------+-------------------+
+           |
+           v
++------------------------------+
+| /egress API                  |
+| - Return structured JSON     |
+| - Include metadata           |
+| - Store audit trail          |
++------------------------------+
+           |
+           v
+          END
+```
+
+---
+
+## 5. Phase-wise Implementation Plan
+
+---
+
+### PHASE 1: Foundation & Core Pipeline
+
+**Duration:** Weeks 1-4
+**Goal:** Build the end-to-end pipeline with offline-only extraction working
+**Phase Status:** IN PROGRESS
+
+---
+
+#### Week 1: Project Setup & API Skeleton
+
+| Task ID | Task                              | Detail                                                                                      | Status   |
+|---------|-----------------------------------|---------------------------------------------------------------------------------------------|----------|
+| 1.1.1   | Initialize project repository     | Create repo, .gitignore, README                                                             | done     |
+| 1.1.2   | Define folder structure            | Root-level scripts for now; `src/` refactor planned                                         | prog     |
+| 1.1.3   | Set up virtual environment         | Python 3.12 venv created (venv312/)                                                         | done     |
+| 1.1.4   | Install core dependencies          | paddleocr, paddlepaddle, pypdfium2, requests, python-dotenv installed in venv                | done     |
+| 1.1.5   | Create `/ingress` API endpoint     | FastAPI POST endpoint accepting multipart/form-data (PDF or Image)                          | todo     |
+| 1.1.6   | Create `/egress` API endpoint      | FastAPI GET endpoint returning JSON by document_id                                          | todo     |
+| 1.1.7   | Create `/status` API endpoint      | FastAPI GET endpoint returning pipeline status for a document_id                            | todo     |
+| 1.1.8   | Implement file validation          | Check file type (PDF/PNG/JPG/TIFF), file size (max 20MB), basic integrity                   | todo     |
+| 1.1.9   | Implement document_id generation   | UUID v4 generation, attach to every document at ingress                                     | todo     |
+| 1.1.10  | Set up local file storage          | Store uploaded files in organized directory: `/storage/{document_id}/original/`              | todo     |
+| 1.1.11  | Create config system               | YAML/ENV based config for quality thresholds, API keys, model paths, retry limits           | prog     |
+| 1.1.12  | Set up logging                     | Structured logging (JSON format) with levels: DEBUG, INFO, WARN, ERROR                      | todo     |
+| 1.1.13  | Create requirements.txt            | Pin all dependencies with versions                                                          | todo     |
+
+**Deliverable:** Running FastAPI server with ingress/egress/status endpoints, file validation, and storage.
+
+**Notes:**
+- Virtual environment and core OCR dependencies are installed.
+- Config is partially done via `.env` file (CXAI API key loaded with python-dotenv).
+- API endpoints (FastAPI) not yet created — current code is CLI-only.
+- No `requirements.txt` exists yet — needs to be generated from the venv.
+
+**Scope of Improvement (deferred):**
+- Add rate limiting middleware (Phase 2)
+- Add authentication/API keys (Phase 2)
+- Move to cloud storage S3/MinIO (Phase 3)
+- Add request deduplication using file hash (Phase 2)
+
+---
+
+#### Week 2: Preprocessing Pipeline
+
+| Task ID | Task                              | Detail                                                                                      | Status   |
+|---------|-----------------------------------|---------------------------------------------------------------------------------------------|----------|
+| 1.2.1   | PDF to Image converter             | Use PyMuPDF (fitz) / pypdfium2 to convert PDF pages to images at 300 DPI                    | done     |
+| 1.2.2   | Multi-page PDF handling            | Each page as separate image; track page numbers in metadata                                 | prog     |
+| 1.2.3   | Image deskewing                    | Use OpenCV `cv2.minAreaRect` or `deskew` library; correct rotation up to +-15 degrees       | todo     |
+| 1.2.4   | Image denoising                    | Apply `cv2.fastNlMeansDenoising()` for grayscale                                           | todo     |
+| 1.2.5   | Image binarization                 | Apply adaptive thresholding                                                                  | todo     |
+| 1.2.6   | Contrast enhancement               | Apply CLAHE (Contrast Limited Adaptive Histogram Equalization)                              | todo     |
+| 1.2.7   | Blur detection                     | Compute Laplacian variance; threshold: <100 = blurry                                       | todo     |
+| 1.2.8   | Resolution check                   | Extract DPI from image metadata; minimum acceptable: 150 DPI                                | todo     |
+| 1.2.9   | Brightness check                   | Calculate mean pixel intensity; range: 50-220 acceptable                                    | todo     |
+| 1.2.10  | Quality score computation          | Weighted: 0.4*blur + 0.3*resolution + 0.3*brightness; pass threshold: 0.6                  | todo     |
+| 1.2.11  | Quality report generation          | Return JSON with scores, pass/fail, failure_reasons, suggestions                            | todo     |
+| 1.2.12  | Re-upload flow                     | On quality fail: return 422 with quality report and request_reupload=true                   | todo     |
+| 1.2.13  | Store preprocessed images          | Save to `/storage/{document_id}/preprocessed/`                                              | todo     |
+| 1.2.14  | Language/script detection          | Check Unicode ranges: Devanagari U+0900-U+097F, Latin U+0041-U+007A                        | todo     |
+
+**Deliverable:** Complete preprocessing pipeline producing clean, quality-checked images ready for OCR.
+
+**Notes:**
+- PDF-to-image conversion works via pypdfium2 in `vision.py` (renders pages to JPEG for Vision API).
+- PaddleOCR handles its own internal PDF rendering.
+- Multi-page: PaddleOCR processes all pages; Vision currently processes first page only.
+- No image enhancement, quality checks, or language detection implemented yet.
+
+**Scope of Improvement (deferred):**
+- Border/margin detection and cropping (Phase 2)
+- Document orientation detection 0/90/180/270 degrees (Phase 2)
+- Stamp/seal detection and masking (Phase 3)
+- ML-based quality assessment instead of heuristic (Phase 3)
+
+---
+
+#### Week 3: Offline Extraction Engine
+
+| Task ID | Task                              | Detail                                                                                      | Status   |
+|---------|-----------------------------------|---------------------------------------------------------------------------------------------|----------|
+| 1.3.1   | Install PaddleOCR                  | paddlepaddle + paddleocr installed; PP-OCRv5 models downloaded for Devanagari + English      | done     |
+| 1.3.2   | Install Surya OCR (backup)         | Test as alternative; keep as fallback if PaddleOCR underperforms                            | todo     |
+| 1.3.3   | Create OCR wrapper interface       | Abstract `class OCREngine` with `extract(image_path, language) -> ExtractionResult`          | todo     |
+| 1.3.4   | Implement PaddleOCR extraction     | PaddleOCR configured with `use_angle_cls=True, lang='hi'`; runs on PDF input                | done     |
+| 1.3.5   | Implement per-field confidence     | PaddleOCR returns confidence per text box; aggregate stats computed (mean, min, <80% count)  | done     |
+| 1.3.6   | Implement text region grouping     | Group text boxes into logical fields via regex-based structured field extraction             | done     |
+| 1.3.7   | Handle mixed language documents    | Basic handling via PaddleOCR Devanagari model (reads both scripts); no explicit routing yet  | prog     |
+| 1.3.8   | Create ExtractionResult model      | JSON output with pages, combined_text, structured_fields, stats, text_blocks                | done     |
+| 1.3.9   | Benchmark on sample documents      | Tested on land record samples; results visible in output/ocr_output.json                    | prog     |
+| 1.3.10  | Store extraction results           | Results written to output/ directory as JSON files                                          | done     |
+
+**Deliverable:** Working offline OCR extraction that processes documents in Marathi/Hindi/English with confidence scoring.
+
+**Notes:**
+- `paddleocr_pdf_to_json_demo.py` is fully functional. Includes:
+  - Devanagari text corrections (`_fix_text()` for common misreads like maharashtra)
+  - Regex-based structured field extraction (taluka, district, village, pu_id, owner_name, etc.)
+  - Confidence statistics (mean, min, count below 80%)
+  - Latin-to-Devanagari digit normalization
+- Last successful run: 63 text blocks extracted, 44.33s processing time.
+- Abstract OCR interface not yet created (PaddleOCR is called directly).
+
+**Scope of Improvement (deferred):**
+- Table detection and extraction (Phase 2)
+- Checkbox/tick mark detection (Phase 2)
+- Handwriting vs printed text classification (Phase 2)
+- Fine-tune PaddleOCR on domain-specific documents (Phase 3)
+
+---
+
+#### Week 4: Formatting, Verification Skeleton & Integration
+
+| Task ID | Task                              | Detail                                                                                      | Status   |
+|---------|-----------------------------------|---------------------------------------------------------------------------------------------|----------|
+| 1.4.1   | Define output JSON schema          | Maharashtra 7/12 land record template defined in combined.py (OUTPUT_TEMPLATE)               | done     |
+| 1.4.2   | Build formatting module            | GPT-4o-mini maps OCR output to JSON schema; runs as merge step in combined.py               | done     |
+| 1.4.3   | Implement field mapping rules      | Regex-based mapping for structured fields in paddleocr_pdf_to_json_demo.py                  | done     |
+| 1.4.4   | Build verification data model      | Pydantic model for verification status, corrections, retry_count                            | todo     |
+| 1.4.5   | Build verification API endpoints   | POST /verify/{document_id}, GET /verify/{document_id}                                       | todo     |
+| 1.4.6   | Implement retry logic              | On REJECTED: increment retry_count; max 3 retries then MANUAL_ENTRY_REQUIRED                | todo     |
+| 1.4.7   | Store corrections as training data | Store original_value, corrected_value, field_name per correction                            | todo     |
+| 1.4.8   | Integration: wire full pipeline    | combined.py orchestrates OCR + Vision + Merge end-to-end via subprocess + API calls          | done     |
+| 1.4.9   | Create pipeline orchestrator       | State machine: UPLOADED -> PREPROCESSING -> EXTRACTING -> FORMATTING -> VERIFYING -> DONE   | todo     |
+| 1.4.10  | Error handling                     | Basic error handling in combined.py (subprocess failures logged, pipeline continues)         | prog     |
+| 1.4.11  | End-to-end testing                 | Manual testing on land record PDFs; no automated test suite yet                             | prog     |
+
+**Deliverable:** Complete offline-capable pipeline working end-to-end from ingress to egress.
+
+**Notes:**
+- `combined.py` is the working pipeline orchestrator:
+  - Runs PaddleOCR and Vision API in parallel using `concurrent.futures.ThreadPoolExecutor`
+  - Sends both outputs to GPT-4o-mini for merging into the defined JSON template
+  - Writes merged output to `output/combined_output.json`
+  - Handles Vision API failure gracefully (falls back to OCR-only merge)
+- Last run: PaddleOCR succeeded (44.33s), Vision API failed (21.8s), merge succeeded (7.13s)
+- Verification UI, retry logic, and state machine not yet implemented
+- Pipeline is CLI-based; no REST API yet
+
+**Scope of Improvement (deferred):**
+- Template-based extraction for known document types (Phase 2)
+- Batch processing support (Phase 2)
+- Webhook notifications on completion (Phase 2)
+
+---
+
+### PHASE 2: Intelligence & Optimization
+
+**Duration:** Weeks 5-8
+**Goal:** Add online GPT integration refinement, dual extraction polish, merge logic, and verification UI
+**Phase Status:** NOT STARTED (some components prototyped ahead of schedule)
+
+---
+
+#### Week 5: GPT Vision API Integration
+
+| Task ID | Task                              | Detail                                                                                      | Status   |
+|---------|-----------------------------------|---------------------------------------------------------------------------------------------|----------|
+| 2.1.1   | Network connectivity checker       | Ping test to API endpoint; check API key validity; measure latency                          | todo     |
+| 2.1.2   | GPT Vision API client              | Client class with async extract method; uses gpt-4-vision or latest model                   | done     |
+| 2.1.3   | Craft extraction prompt            | Detailed prompt with document type, expected fields, language, output format                 | done     |
+| 2.1.4   | Implement timeout & fallback       | 30s timeout; on timeout/error fall back to offline-only result                              | done     |
+| 2.1.5   | Implement retry with backoff       | On 429 or 5xx: retry up to 3 times with exponential backoff                                 | todo     |
+| 2.1.6   | Image preparation for API          | PDF page to base64 JPEG; compress if >5MB                                                   | done     |
+| 2.1.7   | Cost tracking                      | Log every API call with tokens, cost, timestamp                                             | todo     |
+| 2.1.8   | Test GPT Vision extraction         | Tested on sample documents; results in output/vision_output.json                            | prog     |
+
+**Notes:**
+- `vision.py` is functional: converts PDF pages to base64 JPEG, sends to Cisco CXAI Vision API.
+- Timeout handling exists (last run failed after 21.8s; pipeline continued with OCR-only).
+- No retry with backoff, no cost tracking, no formal network checker.
+
+**Scope of Improvement (deferred):**
+- Model version configuration for easy swapping (Phase 2)
+- Cost budgeting and alerting (Phase 3)
+- Caching for identical documents (Phase 3)
+
+---
+
+#### Week 6: Dual Extraction & Merge Logic
+
+| Task ID | Task                              | Detail                                                                                      | Status   |
+|---------|-----------------------------------|---------------------------------------------------------------------------------------------|----------|
+| 2.2.1   | Implement async parallel execution | Use concurrent execution to run offline OCR and GPT Vision simultaneously                   | done     |
+| 2.2.2   | Create merge strategy              | Define merge rules: agree=HIGH, disagree=prefer higher confidence, one missing=use available | prog     |
+| 2.2.3   | GPT-4o-mini merge client           | Send both extraction outputs to GPT-4o-mini with merge prompt                               | done     |
+| 2.2.4   | Merge prompt template              | Detailed merge prompt instructing field-by-field comparison and conflict resolution          | done     |
+| 2.2.5   | Confidence-based routing           | Route to dual extraction only when offline confidence is low; skip GPT when confidence high  | todo     |
+| 2.2.6   | Fallback chain                     | Priority: merged > GPT-only > offline-only > FAIL                                           | done     |
+| 2.2.7   | Test dual extraction               | Tested online, offline, and timeout scenarios                                               | prog     |
+| 2.2.8   | Performance benchmarking            | Last measured: offline ~44s, total ~51s; target: offline <5s, online <15s                   | prog     |
+
+**Notes:**
+- `combined.py` already implements parallel execution via `ThreadPoolExecutor`.
+- Merge via GPT-4o-mini is working: prompt sends both outputs and merges into template.
+- Fallback chain works: when Vision fails, merge proceeds with PaddleOCR output only.
+- Performance needs improvement: 44s for OCR is above the 5s target (likely first-run model loading).
+- Confidence-based routing not yet implemented (always runs both when online).
+
+**Merge Prompt Template (implemented in combined.py):**
+
+```
+SYSTEM:
+You are a document data extraction merger. Your job is to combine
+two independent extractions of the same document into one accurate result.
+
+EXTRACTION A (Offline OCR - PaddleOCR):
+{offline_ocr_output_json}
+
+EXTRACTION B (Online Vision - GPT Vision API):
+{gpt_vision_output_json}
+
+RULES:
+1. Compare both extractions field by field.
+2. Where both agree -> use that value, confidence = HIGH.
+3. Where they disagree -> prefer higher confidence source.
+4. Where one is missing -> use available value.
+5. Do NOT hallucinate data not present in either extraction.
+
+OUTPUT FORMAT:
+Return ONLY valid JSON matching this schema:
+{output_json_schema}
+```
+
+**Scope of Improvement (deferred):**
+- Weighted merge based on historical accuracy per model per language (Phase 3)
+- A/B testing framework for merge strategies (Phase 3)
+
+---
+
+#### Week 7: Verification UI & Human-in-the-Loop
+
+| Task ID | Task                              | Detail                                                                                      | Status   |
+|---------|-----------------------------------|---------------------------------------------------------------------------------------------|----------|
+| 2.3.1   | Design verification UI wireframe   | Side-by-side: LEFT = original image, RIGHT = extracted fields (editable)                    | todo     |
+| 2.3.2   | Build verification frontend        | Simple web UI (React or HTML); image viewer, field editor, confidence indicators             | todo     |
+| 2.3.3   | Implement role-based verification  | Farmer verifies personal fields; Official verifies all fields + approve                     | todo     |
+| 2.3.4   | Implement auto-approval            | If ALL field confidences >= 0.95: auto-approve (configurable)                               | todo     |
+| 2.3.5   | Implement correction tracking      | Store original_value, corrected_value, corrected_by, timestamp per edit                     | todo     |
+| 2.3.6   | Implement offline verification     | Service worker / local cache; sync corrections when network returns                         | todo     |
+| 2.3.7   | Re-extraction trigger              | On REJECT: re-trigger extraction, increment retry_count, show previous attempts             | todo     |
+
+**Scope of Improvement (deferred):**
+- Bulk verification / approve multiple documents (Phase 3)
+- Keyboard shortcuts for faster verification (Phase 2)
+- Verification analytics dashboard (Phase 3)
+
+---
+
+#### Week 8: API Hardening & Integration Testing
+
+| Task ID | Task                              | Detail                                                                                      | Status   |
+|---------|-----------------------------------|---------------------------------------------------------------------------------------------|----------|
+| 2.4.1   | Add API authentication             | API key-based auth for /ingress and /egress; JWT tokens for verification UI                 | todo     |
+| 2.4.2   | Add rate limiting                  | /ingress: max 100 req/min; /egress: max 500 req/min                                        | todo     |
+| 2.4.3   | Add request deduplication          | Hash uploaded file content; if same hash within 24h return existing document_id              | todo     |
+| 2.4.4   | Add webhook support                | On pipeline completion: POST to configured webhook URL                                      | todo     |
+| 2.4.5   | Implement audit trail API          | GET /audit/{document_id} returns full pipeline history                                      | todo     |
+| 2.4.6   | Comprehensive error handling       | Standardize: {error_code, message, detail, document_id, stage_failed}                       | todo     |
+| 2.4.7   | Load testing                       | 100 concurrent uploads; measure throughput, p50/p95/p99 latency, error rate                 | todo     |
+| 2.4.8   | Integration test suite             | Automated tests: happy path, quality fail, offline extraction, dual extraction, verification | todo     |
+| 2.4.9   | Documentation                      | API docs (OpenAPI/Swagger via FastAPI), deployment guide, configuration guide                | todo     |
+
+---
+
+### PHASE 3: Scale & Custom Model
+
+**Duration:** Weeks 9-12
+**Goal:** Train custom model, optimize performance, prepare for production scale
+**Phase Status:** NOT STARTED
+
+---
+
+#### Weeks 9-10: Custom Model Development
+
+| Task ID | Task                              | Detail                                                                                      | Status   |
+|---------|-----------------------------------|---------------------------------------------------------------------------------------------|----------|
+| 3.1.1   | Aggregate training data            | Collect verification corrections from Phase 1 & 2; target 1000+ annotated samples/language  | todo     |
+| 3.1.2   | Data annotation pipeline           | Build annotation tool if corrections are insufficient; label text regions + transcriptions   | todo     |
+| 3.1.3   | Fine-tune PaddleOCR                | Fine-tune recognition model on collected data; focus on domain vocabulary and handwriting    | todo     |
+| 3.1.4   | Fine-tune for each language        | Separate fine-tuning for Marathi, Hindi, English; evaluate independently                    | todo     |
+| 3.1.5   | Model evaluation                   | Compare base vs fine-tuned: CER, WER, field-level accuracy; target >10% improvement         | todo     |
+| 3.1.6   | Model size optimization            | Quantize to INT8; target <200MB per language model; acceptable accuracy drop <2%             | todo     |
+| 3.1.7   | A/B testing framework              | Route X% traffic to fine-tuned model; compare accuracy in production                        | todo     |
+| 3.1.8   | Model versioning                   | Track model files, training data hash, evaluation metrics, deployment date; enable rollback  | todo     |
+
+---
+
+#### Weeks 11-12: Production Readiness
+
+| Task ID | Task                              | Detail                                                                                      | Status   |
+|---------|-----------------------------------|---------------------------------------------------------------------------------------------|----------|
+| 3.2.1   | Database integration               | File storage to PostgreSQL + MongoDB; structured metadata in PostgreSQL                     | todo     |
+| 3.2.2   | Queue-based processing             | Redis Queue / Celery / RabbitMQ for async; decouple ingress from processing                 | todo     |
+| 3.2.3   | Containerization                   | Docker: API server, processing worker, verification UI; Docker Compose for local dev        | todo     |
+| 3.2.4   | Monitoring & alerting              | Prometheus metrics, Grafana dashboard; track docs processed, accuracy, latency, GPT costs   | todo     |
+| 3.2.5   | Batch processing                   | Bulk upload via ZIP; parallel processing; batch results                                     | todo     |
+| 3.2.6   | Data privacy compliance            | Audit PII sent to OpenAI; data retention policies; encryption at rest/transit; DPDP Act     | todo     |
+| 3.2.7   | Performance optimization           | Profile bottlenecks; GPU for preprocessing; OCR batch processing; response caching           | todo     |
+| 3.2.8   | Deployment guide                   | Server requirements, deployment steps, env vars, model download, first-run setup            | todo     |
+| 3.2.9   | User acceptance testing            | Test with real farmers and officials; collect feedback; iterate                              | todo     |
+
+---
+
+## 6. Component Specifications
+
+### 6.1 Preprocessing Module
+
+```
+File: src/preprocessing/image_processor.py
+
+class ImageProcessor:
+    Methods:
+        convert_pdf_to_images(pdf_path, dpi=300) -> List[ImagePath]
+        deskew(image_path) -> ImagePath
+        denoise(image_path) -> ImagePath
+        binarize(image_path) -> ImagePath
+        enhance_contrast(image_path) -> ImagePath
+        check_quality(image_path) -> QualityReport
+        preprocess_pipeline(input_path) -> PreprocessResult
+
+    Quality Thresholds (configurable via config.yaml):
+        blur_threshold: 100.0
+        min_resolution: 150
+        brightness_range: [50, 220]
+        overall_pass_threshold: 0.6
+```
+
+### 6.2 Extraction Module
+
+```
+File: src/extraction/engine.py
+
+class ExtractionEngine:
+    Methods:
+        extract_offline(image_path, language) -> ExtractionResult
+        extract_online(image_path, language) -> ExtractionResult
+        extract_dual(image_path, language) -> MergedExtractionResult
+        merge_results(offline_result, online_result) -> MergedExtractionResult
+
+    Routing Logic:
+        IF network_available AND offline_confidence < 0.80:
+            -> dual extraction (parallel)
+        ELIF network_available AND offline_confidence >= 0.80:
+            -> offline only (save cost)
+        ELSE:
+            -> offline only (no choice)
+
+    Fallback Chain:
+        1. Merged result (best)
+        2. GPT-only result
+        3. Offline-only result
+        4. FAIL
+```
+
+### 6.3 Formatting Module
+
+```
+File: src/formatting/formatter.py
+
+class DocumentFormatter:
+    Methods:
+        format(extraction_result, schema) -> FormattedDocument
+        validate(formatted_doc) -> ValidationResult
+        map_fields(raw_text, field_rules) -> Dict[str, FieldValue]
+
+    Field Mapping Rules (configurable via YAML):
+        - name: regex patterns for name detection
+        - date: multiple date format parsers
+        - aadhaar: 12-digit pattern with checksum
+        - phone: 10-digit Indian mobile pattern
+        - address: multi-line grouping logic
+        - pincode: 6-digit pattern
+
+    Missing Field Handling:
+        - Mandatory field missing -> flag as INCOMPLETE
+        - Optional field missing -> set null
+        - Low confidence field -> include but flag
+```
+
+---
+
+## 7. API Contracts
+
+### 7.1 POST /ingress
+
+**Request:**
+
+```
+Content-Type: multipart/form-data
+
+Fields:
+  file: <binary>           (required) PDF or Image file
+  language_hint: string     (optional) "marathi" | "hindi" | "english" | "auto"
+  document_type: string     (optional) "land_record" | "id_card" | "certificate" | "other"
+  callback_url: string      (optional) Webhook URL for completion notification
+```
+
+**Response (Success - 202 Accepted):**
+
+```json
+{
+  "document_id": "550e8400-e29b-41d4-a716-446655440000",
+  "status": "UPLOADED",
+  "message": "Document received. Processing will begin shortly.",
+  "status_url": "/status/550e8400-e29b-41d4-a716-446655440000",
+  "egress_url": "/egress/550e8400-e29b-41d4-a716-446655440000"
+}
+```
+
+**Response (Quality Fail - 422):**
+
+```json
+{
+  "document_id": "550e8400-e29b-41d4-a716-446655440000",
+  "status": "QUALITY_FAILED",
+  "quality_report": {
+    "quality_score": 0.35,
+    "blur_score": 0.2,
+    "resolution_score": 0.4,
+    "brightness_score": 0.5,
+    "passed": false,
+    "failure_reasons": ["Image is too blurry", "Resolution below minimum"],
+    "suggestions": ["Retake photo with better focus", "Ensure adequate lighting"]
+  },
+  "request_reupload": true
+}
+```
+
+**Response (Validation Fail - 400):**
+
+```json
+{
+  "error_code": "INVALID_FILE",
+  "message": "Unsupported file type. Accepted: PDF, PNG, JPG, TIFF",
+  "detail": "Received file type: application/zip"
+}
+```
+
+### 7.2 GET /egress/{document_id}
+
+**Response (Success - 200):**
+
+```json
+{
+  "document_id": "550e8400-e29b-41d4-a716-446655440000",
+  "status": "COMPLETED",
+  "extraction_method": "DUAL_MERGED",
+  "overall_confidence": 0.92,
+  "language_detected": "marathi",
+  "verified_by": "official_12345",
+  "verified_at": "2026-03-10T14:30:00Z",
+  "data": { "...see JSON Output Schema..." },
+  "metadata": {
+    "ingress_timestamp": "2026-03-10T14:25:00Z",
+    "processing_duration_ms": 8500,
+    "pages_processed": 2,
+    "retry_count": 0
+  }
+}
+```
+
+**Response (Not Ready - 202):**
+
+```json
+{
+  "document_id": "550e8400-e29b-41d4-a716-446655440000",
+  "status": "EXTRACTING",
+  "message": "Document is still being processed.",
+  "estimated_completion_seconds": 10
+}
+```
+
+### 7.3 GET /status/{document_id}
+
+**Response:**
+
+```json
+{
+  "document_id": "550e8400-e29b-41d4-a716-446655440000",
+  "current_status": "VERIFYING",
+  "pipeline_stages": {
+    "UPLOADED":       { "completed": true,  "timestamp": "2026-03-10T14:25:00Z" },
+    "PREPROCESSING":  { "completed": true,  "timestamp": "2026-03-10T14:25:02Z" },
+    "EXTRACTING":     { "completed": true,  "timestamp": "2026-03-10T14:25:08Z" },
+    "FORMATTING":     { "completed": true,  "timestamp": "2026-03-10T14:25:09Z" },
+    "VERIFYING":      { "completed": false, "timestamp": null },
+    "COMPLETED":      { "completed": false, "timestamp": null }
+  }
+}
+```
+
+### 7.4 POST /verify/{document_id}
+
+**Request:**
+
+```json
+{
+  "verified_by": "farmer_67890",
+  "role": "farmer",
+  "decision": "APPROVED",
+  "corrections": [
+    {
+      "field_name": "holder_name",
+      "original_value": "राजेश कुमार",
+      "corrected_value": "राजेश कुमार पाटील"
+    }
+  ]
+}
+```
+
+**Response:**
+
+```json
+{
+  "document_id": "550e8400-e29b-41d4-a716-446655440000",
+  "status": "COMPLETED",
+  "message": "Verification recorded. Document approved.",
+  "corrections_saved": 1,
+  "training_data_logged": true
+}
+```
+
+---
+
+## 8. JSON Output Schema
+
+```json
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "ExtractedDocumentData",
+  "type": "object",
+  "properties": {
+    "personal_info": {
+      "type": "object",
+      "properties": {
+        "full_name":       { "type": ["string", "null"] },
+        "full_name_local": { "type": ["string", "null"], "description": "Name in Devanagari" },
+        "father_name":     { "type": ["string", "null"] },
+        "date_of_birth":   { "type": ["string", "null"], "format": "date" },
+        "gender":          { "type": ["string", "null"], "enum": ["male", "female", "other", null] },
+        "phone":           { "type": ["string", "null"], "pattern": "^[6-9]\\d{9}$" },
+        "aadhaar_number":  { "type": ["string", "null"], "pattern": "^\\d{12}$" },
+        "address": {
+          "type": "object",
+          "properties": {
+            "full_address": { "type": ["string", "null"] },
+            "village":      { "type": ["string", "null"] },
+            "taluka":       { "type": ["string", "null"] },
+            "district":     { "type": ["string", "null"] },
+            "state":        { "type": ["string", "null"] },
+            "pincode":      { "type": ["string", "null"], "pattern": "^\\d{6}$" }
+          }
+        }
+      }
+    },
+    "document_info": {
+      "type": "object",
+      "properties": {
+        "document_type":     { "type": ["string", "null"] },
+        "document_number":   { "type": ["string", "null"] },
+        "issue_date":        { "type": ["string", "null"], "format": "date" },
+        "issuing_authority":  { "type": ["string", "null"] }
+      }
+    },
+    "land_info": {
+      "type": ["object", "null"],
+      "properties": {
+        "survey_number":  { "type": ["string", "null"] },
+        "plot_number":    { "type": ["string", "null"] },
+        "area_acres":     { "type": ["number", "null"] },
+        "area_hectares":  { "type": ["number", "null"] },
+        "land_type":      { "type": ["string", "null"] },
+        "crop_details":   { "type": ["string", "null"] }
+      }
+    },
+    "field_confidences": {
+      "type": "object",
+      "description": "Confidence score (0-1) for each extracted field",
+      "additionalProperties": { "type": "number", "minimum": 0, "maximum": 1 }
+    },
+    "flags": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Warnings or issues: ['low_confidence_name', 'missing_mandatory_aadhaar']"
+    }
+  },
+  "required": ["personal_info", "document_info", "field_confidences", "flags"]
+}
+```
+
+---
+
+## 9. Tech Stack
+
+| Component              | Technology                    | Status   | Reason                                              |
+|------------------------|-------------------------------|----------|-----------------------------------------------------|
+| API Framework          | FastAPI (Python)              | todo     | Async support, auto-docs, Pydantic validation       |
+| PDF Processing         | pypdfium2 / PyMuPDF (fitz)    | done     | Fast, lightweight, good rendering quality            |
+| Image Processing       | OpenCV, Pillow                | todo     | Industry standard for preprocessing                 |
+| Offline OCR (Primary)  | PaddleOCR (PP-OCRv5)         | done     | Best accuracy for Indic scripts, lightweight         |
+| Offline OCR (Backup)   | Surya OCR                     | todo     | Good alternative, modern architecture                |
+| Online Extraction      | GPT Vision API (Cisco CXAI)   | done     | Best-in-class multimodal understanding               |
+| Online Merge           | GPT-4o-mini API (Cisco CXAI)  | done     | Fast, cost-effective, good at structured output      |
+| Data Validation        | Pydantic v2                   | todo     | Type-safe, fast, native FastAPI integration          |
+| Task Queue             | Celery + Redis                | todo     | Async processing, retry logic (Phase 3)              |
+| Storage (Phase 1)      | Local filesystem              | done     | Simple, fast for prototyping                         |
+| Storage (Phase 3)      | PostgreSQL + MinIO            | todo     | Structured data + object storage                     |
+| Verification UI        | React or plain HTML/JS        | todo     | Simple, offline-capable with service workers         |
+| Containerization       | Docker + Docker Compose       | todo     | Consistent environments, easy deployment             |
+| Monitoring (Phase 3)   | Prometheus + Grafana          | todo     | Industry standard observability                      |
+
+---
+
+## 10. Scope of Improvement Log
+
+This is a living section. Track all known improvements here. Update status as items are addressed.
+
+| ID      | Area           | Improvement                                              | Priority | Phase | Status |
+|---------|----------------|----------------------------------------------------------|----------|-------|--------|
+| IMP-001 | Ingress        | Add rate limiting middleware                             | Medium   | 2     | todo   |
+| IMP-002 | Ingress        | Add API key authentication                               | High     | 2     | todo   |
+| IMP-003 | Ingress        | Request deduplication via file hash                      | Medium   | 2     | todo   |
+| IMP-004 | Preprocessing  | Document orientation detection (0/90/180/270 degrees)   | Medium   | 2     | todo   |
+| IMP-005 | Preprocessing  | Border/margin detection and auto-crop                    | Low      | 2     | todo   |
+| IMP-006 | Preprocessing  | Stamp/seal detection and masking                         | Low      | 3     | todo   |
+| IMP-007 | Preprocessing  | ML-based quality assessment (replace heuristic)          | Low      | 3     | todo   |
+| IMP-008 | Extraction     | Table detection and structured extraction                | High     | 2     | todo   |
+| IMP-009 | Extraction     | Checkbox/tick mark detection                             | Medium   | 2     | todo   |
+| IMP-010 | Extraction     | Handwriting vs printed text classifier                   | Medium   | 2     | todo   |
+| IMP-011 | Extraction     | Template-based extraction for known document types       | High     | 2     | todo   |
+| IMP-012 | Extraction     | Fine-tune PaddleOCR on domain-specific data              | High     | 3     | todo   |
+| IMP-013 | Extraction     | Weighted merge based on historical accuracy              | Medium   | 3     | todo   |
+| IMP-014 | Formatting     | Transliteration (Devanagari to/from Latin)               | Medium   | 2     | todo   |
+| IMP-015 | Verification   | Bulk verification support                                | Medium   | 3     | todo   |
+| IMP-016 | Verification   | Keyboard shortcuts for faster verification               | Low      | 2     | todo   |
+| IMP-017 | Verification   | Verification analytics dashboard                         | Low      | 3     | todo   |
+| IMP-018 | Egress         | Webhook notifications on completion                      | Medium   | 2     | todo   |
+| IMP-019 | Egress         | Batch export (ZIP of multiple JSONs)                     | Low      | 3     | todo   |
+| IMP-020 | Infrastructure | Move to cloud storage (S3/MinIO)                         | Medium   | 3     | todo   |
+| IMP-021 | Infrastructure | Queue-based async processing (Celery)                    | High     | 3     | todo   |
+| IMP-022 | Infrastructure | Containerization (Docker)                                | High     | 3     | todo   |
+| IMP-023 | Infrastructure | Monitoring (Prometheus + Grafana)                        | Medium   | 3     | todo   |
+| IMP-024 | Security       | PII masking before sending to OpenAI                     | High     | 2     | todo   |
+| IMP-025 | Security       | Encryption at rest for stored documents                  | High     | 3     | todo   |
+| IMP-026 | Security       | DPDP Act compliance audit                                | High     | 3     | todo   |
+| IMP-027 | Model          | Model versioning and rollback capability                 | Medium   | 3     | todo   |
+| IMP-028 | Model          | A/B testing framework for model comparison               | Medium   | 3     | todo   |
+| IMP-029 | Model          | INT8 quantization for smaller model size                 | Medium   | 3     | todo   |
+| IMP-030 | Cost           | GPT API cost budgeting and alerting                      | Medium   | 3     | todo   |
+
+---
+
+## 11. Risk Matrix
+
+| Risk                                        | Probability | Impact | Severity    | Mitigation                                                                              |
+|---------------------------------------------|-------------|--------|-------------|-----------------------------------------------------------------------------------------|
+| Low OCR accuracy on handwritten Indic text   | High        | High   | CRITICAL    | Invest in preprocessing; fine-tune model Phase 3; flag low-confidence for human review  |
+| GPT API downtime / rate limiting             | Medium      | Medium | MODERATE    | Offline fallback always available; retry with backoff; never block pipeline on API       |
+| High GPT API costs at scale                  | Medium      | Medium | MODERATE    | Confidence-based routing; cost tracking; budget alerts                                  |
+| PII data sent to OpenAI servers              | High        | High   | CRITICAL    | PII masking/redaction before API call; review data policies; consider Azure OpenAI       |
+| Network unavailability in rural areas        | High        | Medium | MODERATE    | Full offline pipeline is core requirement; sync when connected                          |
+| Verification bottleneck (slow human review)  | Medium      | Medium | MODERATE    | Auto-approve high-confidence; batch verification; simple UI for speed                   |
+| Mixed language documents causing confusion   | Medium      | Medium | MODERATE    | Script detection + language routing; test extensively on mixed docs                     |
+| Model drift over time                        | Low         | Medium | LOW         | Periodic retraining with correction data; model version tracking                        |
+| Multi-page PDF processing failures           | Low         | Low    | LOW         | Process pages independently; if one page fails continue others                          |
+
+---
+
+## 12. Folder Structure
+
+### Current State (as of March 11, 2026)
+
+```
+test01/
+├── .env                              # API key configuration (Cisco CXAI)
+├── combined.py                       # Main pipeline orchestrator (CLI)
+├── vision.py                         # GPT Vision extraction module
+├── paddleocr_pdf_to_json_demo.py     # PaddleOCR extraction module
+├── tempPlan.txt                      # This plan document
+├── output/
+│   ├── combined_output.json          # Merged extraction output
+│   ├── ocr_output.json               # PaddleOCR raw output
+│   └── vision_output.json            # Vision API raw output
+├── docs/
+│   └── Meeting01.txt                 # F4F stakeholder meeting notes
+├── venv312/                          # Python 3.12 virtual environment
+└── venv/                             # Alternate virtual environment
+```
+
+### Target State (end of Phase 1)
+
+```
+docextract-pipeline/
+├── README.md
+├── requirements.txt
+├── pyproject.toml
+├── .env
+├── config/
+│   ├── config.yaml
+│   ├── config.dev.yaml
+│   ├── config.prod.yaml
+│   └── field_mapping_rules.yaml
+├── src/
+│   ├── __init__.py
+│   ├── main.py                        # FastAPI app entry point
+│   ├── api/
+│   │   ├── __init__.py
+│   │   ├── ingress.py
+│   │   ├── egress.py
+│   │   ├── status.py
+│   │   ├── verify.py
+│   │   └── audit.py
+│   ├── models/
+│   │   ├── __init__.py
+│   │   ├── document.py
+│   │   ├── extraction.py
+│   │   ├── quality.py
+│   │   ├── verification.py
+│   │   └── schema.py
+│   ├── preprocessing/
+│   │   ├── __init__.py
+│   │   ├── pdf_converter.py
+│   │   ├── image_enhancer.py
+│   │   ├── quality_checker.py
+│   │   ├── language_detector.py
+│   │   └── pipeline.py
+│   ├── extraction/
+│   │   ├── __init__.py
+│   │   ├── ocr_interface.py
+│   │   ├── paddle_ocr_engine.py
+│   │   ├── surya_ocr_engine.py
+│   │   ├── gpt_vision_client.py
+│   │   ├── gpt_merge_client.py
+│   │   ├── dual_extractor.py
+│   │   ├── confidence_scorer.py
+│   │   └── network_checker.py
+│   ├── formatting/
+│   │   ├── __init__.py
+│   │   ├── field_mapper.py
+│   │   ├── formatter.py
+│   │   └── validator.py
+│   ├── verification/
+│   │   ├── __init__.py
+│   │   ├── verifier.py
+│   │   ├── auto_approver.py
+│   │   └── correction_tracker.py
+│   ├── pipeline/
+│   │   ├── __init__.py
+│   │   ├── orchestrator.py
+│   │   └── state_manager.py
+│   ├── storage/
+│   │   ├── __init__.py
+│   │   ├── file_store.py
+│   │   ├── metadata_store.py
+│   │   └── training_data_store.py
+│   └── utils/
+│       ├── __init__.py
+│       ├── config_loader.py
+│       ├── logger.py
+│       ├── id_generator.py
+│       └── cost_tracker.py
+├── models/
+│   ├── paddleocr/
+│   │   ├── hindi/
+│   │   └── english/
+│   └── surya/
+├── storage/
+│   └── {document_id}/
+│       ├── original/
+│       ├── pages/
+│       ├── preprocessed/
+│       └── extraction/
+├── tests/
+│   ├── __init__.py
+│   ├── test_ingress.py
+│   ├── test_preprocessing.py
+│   ├── test_extraction.py
+│   ├── test_formatting.py
+│   ├── test_verification.py
+│   ├── test_pipeline_e2e.py
+│   └── sample_documents/
+│       ├── marathi/
+│       ├── hindi/
+│       ├── english/
+│       └── mixed/
+├── scripts/
+│   ├── download_models.sh
+│   ├── benchmark.py
+│   └── seed_test_data.py
+├── docker/
+│   ├── Dockerfile
+│   ├── Dockerfile.worker
+│   └── docker-compose.yml
+└── docs/
+    ├── Meeting01.txt
+    ├── api_reference.md
+    ├── deployment_guide.md
+    ├── configuration_guide.md
+    └── architecture_decisions.md
+```
+
+---
+
+## 13. Quick Start
+
+```bash
+# Clone repository
+git clone <repo-url>
+cd docextract-pipeline
+
+# Create virtual environment
+python -m venv venv
+# Linux/Mac: source venv/bin/activate
+# Windows:   venv\Scripts\activate
+
+# Install dependencies
+pip install -r requirements.txt
+
+# Download OCR models
+bash scripts/download_models.sh
+
+# Configure
+cp config/config.dev.yaml config/config.yaml
+# Edit config.yaml with your settings (API keys, thresholds, etc.)
+
+# Run
+uvicorn src.main:app --reload --host 0.0.0.0 --port 8000
+
+# Test
+curl -X POST http://localhost:8000/ingress \
+  -F "file=@sample_document.pdf" \
+  -F "language_hint=marathi"
+```
+
+---
+
+## Overall Progress Summary
+
+| Phase   | Description                        | Status      | Completion |
+|---------|------------------------------------|-------------|------------|
+| Phase 1 | Foundation & Core Pipeline         | In Progress | ~40%       |
+| Phase 2 | Intelligence & Optimization        | Partial     | ~15%       |
+| Phase 3 | Scale & Custom Model               | Not Started | 0%         |
+
+### What Has Been Completed
+
+1. Project initialization and virtual environment setup
+2. PaddleOCR extraction engine (fully functional with Devanagari corrections, structured field extraction, confidence stats)
+3. GPT Vision API client (PDF-to-base64 conversion, API integration with Cisco CXAI)
+4. Combined pipeline orchestrator (parallel execution, GPT-4o-mini merge, fallback on Vision failure)
+5. Output JSON schema/template for Maharashtra 7/12 land records
+6. CLI interface for all extraction modules
+7. Basic environment configuration via .env
+
+### What Is In Progress
+
+1. Multi-page PDF handling (PaddleOCR does all pages; Vision does first page only)
+2. Mixed language document handling (basic via PaddleOCR; no explicit routing)
+3. Benchmarking on sample documents
+4. Error handling refinement
+5. Folder structure refactoring (flat root -> organized src/)
+
+### Key Blockers / Next Actions
+
+1. **Immediate:** Create `requirements.txt` from current venv
+2. **Immediate:** Set up FastAPI application skeleton with /ingress, /egress, /status endpoints
+3. **Next:** Build image preprocessing pipeline (deskew, denoise, binarize, quality checks)
+4. **Next:** Refactor flat script structure into organized `src/` package layout
+
+---
+
+*This document is maintained as the single source of truth for the DocExtract Pipeline project. Update it as work progresses.*

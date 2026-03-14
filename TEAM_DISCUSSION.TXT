@@ -1,0 +1,85 @@
+
+Meeting summary AI-generated
+
+Overview
+The meeting involves key participants Viraj Mandlik, Matt Barber, and KRK04-2-QR 2009 discussing the development of a document extraction system for legal land records. Viraj presents a proof of concept featuring a multi-phase processing engine that includes preprocessing, dual OCR extraction (online and offline), and human verification to ensure high accuracy. Matt emphasizes the importance of asynchronous job handling with unique job IDs and suggests confidence scoring to optimize human verification efforts.
+
+The team evaluates the performance of the Paddle OCR model and the vision API, noting the benefits of bounding boxes and confidence metrics for processing. Scalability is addressed through containerization and deployment on AWS with Kubernetes and Lambda functions, enabling dynamic scaling and batch job management. Language diversity challenges are acknowledged, with a focus on Hindi, Marathi, and English for the initial phase, and plans for feedback loops to handle new dialects or scripts.
+
+Security is recognized as critical but deferred to later stages after establishing the proof of concept. Integration with WhatsApp chatbots is explored to improve pre-submission image quality checks, potentially reducing manual verification. The team plans a concise five-minute video presentation combining storytelling, solution overview, and a live demo, with roles assigned for backend development, presentation, and front-end support. They schedule follow-up meetings to maintain progress and aim to submit the project by March 17th.
+
+
+Detailed Summary
+POC for Document Extraction
+Viraj Mandlik presents a proof of concept (POC) for a document extraction system designed to process legal land records with high accuracy. The system uses APIs to accept documents in various formats, preprocesses images for quality, extracts text using both online and offline OCR models, and includes a human verification step to ensure data integrity. This approach aims to provide a fast, accurate, and scalable solution for document processing.
+
+Viraj Mandlik explains the system accepts PDFs or images via APIs for processing.
+The preprocessing phase addresses image quality issues like contrast and brightness.
+Extraction engine uses both online vision API and offline Paddle OCR model for text extraction.
+Human verification is included to ensure accuracy due to the legal nature of data.
+Matt Barber suggests returning a unique job ID for asynchronous processing and status querying.
+OCR Models and Accuracy
+The team discusses the performance of the offline Paddle OCR model and the online vision API, noting that the Paddle OCR provides bounding boxes and confidence scores, which are useful for processing. The combined output merges results from both models using GPT-4o mini to format data into JSON templates. Accuracy is reported above 91%, with some challenges in recognizing regional scripts requiring regex adjustments.
+
+Viraj Mandlik demonstrates extraction from Marathi language documents using Paddle OCR.
+Paddle OCR provides confidence scores averaging above 91%.
+Vision API returns data in a different format without confidence scores.
+Combined output merges OCR and GPT-4o mini results into a structured JSON template.
+Matt Barber notes Paddle OCR's bounding boxes make it more flexible for processing.
+System Scalability and Architecture
+The team plans to dockerize the solution and deploy it on AWS using Kubernetes and Lambda functions to enable scalable microservices. This architecture allows dynamic scaling based on demand and supports asynchronous job processing. They discuss queue management for handling batch jobs and ensuring system robustness.
+
+Viraj Mandlik proposes dockerizing the solution for deployment on Kubernetes.
+AWS Lambda functions will handle requests for scalable microservices.
+Matt Barber emphasizes the importance of job management and queue systems for batch processing.
+The system supports asynchronous job submission and status querying via job IDs.
+Scalability is designed to handle varying workloads without human intervention.
+Language and Script Challenges
+The team acknowledges the complexity of processing documents in multiple Indian languages and scripts, focusing initially on Hindi, Marathi, and English for the POC. They discuss the need for a feedback loop to detect failures due to unrecognized scripts or poor image quality and consider mechanisms to adapt to new dialects or document formats over time.
+
+Matt Barber raises concerns about handling multiple dialects and scripts beyond the initial three languages.
+Viraj Mandlik confirms focusing on Hindi, Marathi, and English for the POC phase.
+They discuss implementing a feedback loop for failure detection and system improvement.
+Human verification and confidence scoring help manage accuracy across diverse inputs.
+The system aims to be scalable to support additional languages in the future.
+Security and Data Privacy
+Security considerations are discussed, with the team agreeing that while security should be integrated from the start, the initial focus will be on developing a proof of concept. They plan to secure APIs and data pipelines in subsequent development phases, balancing project timelines with security needs.
+
+Matt Barber recommends building security into the system from the beginning but prioritizing POC development first.
+Viraj Mandlik raises concerns about securing the data extraction pipeline.
+The team acknowledges the legal sensitivity of the data requiring careful handling.
+Security implementation will follow after establishing core functionality.
+They consider secure methods for storing and retrieving images and extracted data.
+Integration with WhatsApp Chatbot
+The team discusses integrating the document extraction system with existing WhatsApp chatbots used by field staff and farmers. They note the current lack of pre-submission quality checks for images uploaded via chatbots and consider exposing APIs for image quality verification to improve input quality before processing.
+
+Viraj Mandlik inquires about integrating with WhatsApp chatbot APIs.
+Matt Barber notes the absence of pre-submission quality checks for chatbot uploads.
+They consider exposing a separate API for image quality verification.
+The chatbot integration aims to reduce manual verification workload.
+The team explores third-party services like Twilio for WhatsApp API integration.
+Presentation and Submission Planning
+The team plans to create a concise five-minute video presentation combining a problem statement, solution overview, and a live demo. They discuss scripting, storyboarding, and dividing presentation roles among team members. Visual aids, AI-generated videos, and clear API documentation are considered to effectively communicate their solution to judges.
+
+Matt Barber suggests a storyboard with a story, solution, demo, and conclusion.
+KRK04-2-QR 2009 emphasizes keeping slides minimal with visuals and flowcharts.
+Viraj Mandlik proposes creating an AI video demonstrating user interaction and backend processing.
+The team agrees on a five-minute total presentation with three minutes for demo.
+Matt Barber offers to build a front end using API documentation for demonstration purposes.
+Team Coordination and Next Steps
+The team agrees to meet again the next day to maintain momentum and finalize the solution. They plan to submit the project by March 17th, one day before the official deadline. Roles are assigned with Viraj focusing on backend and API development, KRK04-2-QR 2009 handling presentation and storytelling, and Matt supporting front-end development and overall coordination.
+
+Team schedules follow-up meeting to continue development.
+Submission deadline set for March 17th to allow buffer before official deadline.
+Viraj Mandlik leads backend and API development.
+KRK04-2-QR 2009 focuses on presentation creation and scripting.
+Matt Barber assists with front-end and integration tasks.
+Action items AI-generated
+
+KRK04-2-QR 2009 will reach out to the expert mentors (e.g., Jennifer, Karthik) to seek advice on creating a more creative and effective presentation or pitch for the solution.
+KRK04-2-QR 2009 will handle creating the presentation slides and storyline, ensuring it is visually clear and concise, and will coordinate with Viraj for technical details to include.
+Matt Barber and the team need to meet again tomorrow at 10 AM to continue progress and keep momentum on the project.
+Viraj Mandlik will continue working on the solution development including the API and create some images and visual aids to support the presentation deck.
+Matt Barber to share a live editable document or link for API design and documentation so the team can collaborate on it in real time.
+Matt Barber needs to prepare a storyboard for the presentation video within the next two days and share it with the team for review and editing.
+KRK04-2-QR 2009 will summarize the meeting discussion and agreed points in a document and share it with Matt to confirm the next meeting time.
