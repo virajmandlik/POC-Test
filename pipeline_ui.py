@@ -1,40 +1,58 @@
 """
-Comparative Analysis Dashboard
-Runs combined.py on raw PDF vs preprocessed image, then compares via GPT-4o-mini.
+Use Case 1 — Land Record OCR & Data Extraction
+
+Self-contained Streamlit app for extracting structured data from
+Maharashtra 7/12 land record documents (PDFs or images).
+
+Supports three extraction modes:
+  - PaddleOCR-only  (offline, subprocess via venv312)
+  - Vision-only     (GPT-4 Vision API, direct HTTP)
+  - Combined        (PaddleOCR + Vision in parallel, merged via GPT-4o-mini)
+
+Supports single document or batch processing with queue system,
+live results table, and CSV/JSON export.
+
+Run:
+    streamlit run pipeline_ui.py
+
+Requires:
+    - paddleocr_pdf_to_json_demo.py  (subprocess worker, runs in venv312)
+    - CXAI_API_KEY in .env            (for Vision and Combined modes)
 """
 
+import base64
+import copy
+import csv
 import io
 import json
+import logging
 import os
 import subprocess
+import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+from queue import Queue
+from typing import Any
 
 import cv2
 import numpy as np
+import pandas as pd
+import pypdfium2 as pdfium
 import requests
 import streamlit as st
 from dotenv import load_dotenv
 from PIL import Image
 
-from preprocess_ui import (
-    DocumentAnalyzer,
-    ImageEnhancer,
-    PDFLoader,
-    QualityChecker,
-    QualityGate,
-    QualityReport,
-    pil_to_cv,
-    cv_to_pil,
-)
-
 load_dotenv()
+
+log = logging.getLogger("pipeline_ui")
 
 BASE_DIR = Path(__file__).parent
 PYTHON_312 = str(BASE_DIR / "venv312" / "Scripts" / "python.exe")
-COMBINED_SCRIPT = str(BASE_DIR / "combined.py")
+PADDLE_SCRIPT = str(BASE_DIR / "paddleocr_pdf_to_json_demo.py")
 UPLOAD_DIR = BASE_DIR / "uploads"
 OUTPUT_DIR = BASE_DIR / "output"
 API_URL = "https://cxai-playground.cisco.com/chat/completions"
@@ -42,64 +60,708 @@ API_URL = "https://cxai-playground.cisco.com/chat/completions"
 UPLOAD_DIR.mkdir(exist_ok=True)
 OUTPUT_DIR.mkdir(exist_ok=True)
 
+# 7/12 extract schema — GPT-4o-mini populates this exact structure
+OUTPUT_TEMPLATE = {
+    "document_type": "",
+    "state": "",
+    "taluka": "",
+    "district": "",
+    "village": "",
+    "village_code": "",
+    "pu_id": "",
+    "survey_number": "",
+    "sub_division": "",
+    "local_name": "",
+    "tenure": {"class": "", "type": ""},
+    "owner": {"name": "", "account_number": ""},
+    "area": {
+        "cultivable": {
+            "jirayat_hectare": "",
+            "bagayat_hectare": "",
+            "total_hectare": "",
+        },
+        "uncultivable": {
+            "class_a_hectare": "",
+            "class_b_hectare": "",
+            "total_hectare": "",
+        },
+        "pot_kharab_hectare": "",
+        "total_area_hectare": "",
+        "unit": "\u0939\u0947.\u0906\u0930.\u091a\u094c.\u092e\u0940.",
+    },
+    "assessment": {"base_rupees": "", "special_rupees": ""},
+    "mutation": {
+        "last_number": "",
+        "last_date": "",
+        "pending": "",
+        "old_numbers": [],
+    },
+    "rights": {"tenant_name": "", "other_rights": ""},
+    "heir_info": "",
+    "boundary_marks": "",
+    "digital_signature": {
+        "date": "",
+        "verification_url": "",
+        "reference_number": "",
+    },
+    "source_comparison": {
+        "fields_differing": {},
+        "paddle_only": [],
+        "vision_only": [],
+    },
+}
 
-# ── Pipeline runner (loosely coupled, no UI) ─────────────────────────
+UC1_CSV_COLUMNS = [
+    "filename", "extraction_mode", "status",
+    "document_type", "state", "district", "taluka", "village",
+    "survey_number", "owner_name", "total_area_hectare",
+    "fields_filled", "fields_total",
+    "processing_time_s", "processed_at_utc",
+]
 
 
-class PipelineRunner:
-    """Runs combined.py as a subprocess and returns results."""
+# ═══════════════════════════════════════════════════════════════════════
+# UTILITY FUNCTIONS
+# ═══════════════════════════════════════════════════════════════════════
 
-    def __init__(self, python_path: str, script_path: str, base_dir: Path):
-        self._python = python_path
-        self._script = script_path
-        self._base_dir = base_dir
 
-    def run(
+def pil_to_cv(img: Image.Image) -> np.ndarray:
+    return cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+
+
+def cv_to_pil(arr: np.ndarray) -> Image.Image:
+    return Image.fromarray(cv2.cvtColor(arr, cv2.COLOR_BGR2RGB))
+
+
+def pdf_page_to_base64(pdf_path: str, page_index: int = 0, scale: float = 2.0) -> str:
+    """Render a single PDF page to a base64-encoded JPEG string."""
+    pdf = pdfium.PdfDocument(pdf_path)
+    if page_index >= len(pdf):
+        raise ValueError(f"Page {page_index} does not exist (PDF has {len(pdf)} pages)")
+    page = pdf[page_index]
+    bitmap = page.render(scale=scale)
+    pil_image = bitmap.to_pil()
+    buf = io.BytesIO()
+    pil_image.save(buf, format="JPEG", quality=90)
+    return base64.b64encode(buf.getvalue()).decode("utf-8")
+
+
+def image_to_base64(image_path: str) -> str:
+    """Read an image file and return its base64-encoded string."""
+    with open(image_path, "rb") as f:
+        return base64.b64encode(f.read()).decode("utf-8")
+
+
+def _count_fields(obj: dict | list) -> tuple[int, int]:
+    """Count filled and empty leaf fields in a nested dict."""
+    filled = 0
+    empty = 0
+    if isinstance(obj, dict):
+        for v in obj.values():
+            if isinstance(v, (dict, list)):
+                f, e = _count_fields(v)
+                filled += f
+                empty += e
+            elif isinstance(v, str):
+                if v:
+                    filled += 1
+                else:
+                    empty += 1
+    elif isinstance(obj, list):
+        if obj:
+            filled += 1
+        else:
+            empty += 1
+    return filled, empty
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# PREPROCESSING CLASSES (from preprocess_ui.py)
+# ═══════════════════════════════════════════════════════════════════════
+
+
+@dataclass
+class QualityReport:
+    width: int = 0
+    height: int = 0
+    megapixels: float = 0.0
+    blur_score: float = 0.0
+    sharpness: str = ""
+    mean_brightness: float = 0.0
+    contrast_ratio: float = 0.0
+    readability: str = ""
+    issues: list[str] = field(default_factory=list)
+
+    @property
+    def passed(self) -> bool:
+        return len(self.issues) == 0
+
+
+class QualityChecker:
+    """Image quality assessment using OpenCV."""
+
+    MIN_MEGAPIXELS = 0.3
+    MIN_BRIGHTNESS = 40
+    MAX_BRIGHTNESS = 230
+    MIN_CONTRAST = 0.15
+    MIN_BLUR_SCORE = 80
+
+    def check(self, img: Image.Image) -> QualityReport:
+        cv_img = pil_to_cv(img)
+        gray = cv2.cvtColor(cv_img, cv2.COLOR_BGR2GRAY)
+        h, w = gray.shape
+        mp = (w * h) / 1_000_000
+
+        blur = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+        brightness = float(np.mean(gray))
+        std = float(np.std(gray))
+        contrast = std / max(brightness, 1)
+
+        if blur > 500:
+            sharpness = "Excellent"
+        elif blur > 200:
+            sharpness = "Good"
+        elif blur > self.MIN_BLUR_SCORE:
+            sharpness = "Acceptable"
+        else:
+            sharpness = "Blurry"
+
+        if 60 < brightness < 200 and contrast > 0.25:
+            readability = "Good"
+        elif 40 < brightness < 220:
+            readability = "Fair"
+        else:
+            readability = "Poor"
+
+        issues: list[str] = []
+        if blur < self.MIN_BLUR_SCORE:
+            issues.append("Image is blurry")
+        if brightness < self.MIN_BRIGHTNESS:
+            issues.append("Image too dark")
+        if brightness > self.MAX_BRIGHTNESS:
+            issues.append("Image overexposed")
+        if mp < self.MIN_MEGAPIXELS:
+            issues.append("Resolution too low")
+        if contrast < self.MIN_CONTRAST:
+            issues.append("Low contrast")
+
+        return QualityReport(
+            width=w, height=h, megapixels=round(mp, 2),
+            blur_score=round(blur, 1), sharpness=sharpness,
+            mean_brightness=round(brightness, 1),
+            contrast_ratio=round(contrast, 3),
+            readability=readability, issues=issues,
+        )
+
+
+class ImageEnhancer:
+    """OpenCV-powered image enhancement."""
+
+    def enhance(
         self,
-        input_path: str,
-        output_path: str,
-        lang: str = "mr",
-        vision_input: str | None = None,
-    ) -> tuple[int, float, str, str]:
-        env = os.environ.copy()
-        env["PYTHONIOENCODING"] = "utf-8"
+        img: Image.Image,
+        contrast: float = 1.5,
+        brightness: float = 1.1,
+        denoise_method: str = "nlm",
+        deskew: bool = False,
+        adaptive_thresh: bool = False,
+    ) -> Image.Image:
+        cv_img = pil_to_cv(img)
 
+        if deskew:
+            cv_img = self._deskew(cv_img)
+
+        if denoise_method == "nlm":
+            cv_img = cv2.fastNlMeansDenoisingColored(cv_img, None, 10, 10, 7, 21)
+        elif denoise_method == "median":
+            cv_img = cv2.medianBlur(cv_img, 3)
+
+        brightness_offset = (brightness - 1.0) * 127
+        cv_img = cv2.convertScaleAbs(cv_img, alpha=contrast, beta=brightness_offset)
+
+        if adaptive_thresh:
+            gray = cv2.cvtColor(cv_img, cv2.COLOR_BGR2GRAY)
+            thresh = cv2.adaptiveThreshold(
+                gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 21, 10,
+            )
+            cv_img = cv2.cvtColor(thresh, cv2.COLOR_GRAY2BGR)
+
+        return cv_to_pil(cv_img)
+
+    def _deskew(self, img: np.ndarray) -> np.ndarray:
+        angle = self.detect_skew_angle(img)
+        if abs(angle) < 0.5:
+            return img
+        h, w = img.shape[:2]
+        center = (w // 2, h // 2)
+        mat = cv2.getRotationMatrix2D(center, angle, 1.0)
+        return cv2.warpAffine(
+            img, mat, (w, h),
+            flags=cv2.INTER_LANCZOS4,
+            borderMode=cv2.BORDER_REPLICATE,
+        )
+
+    @staticmethod
+    def detect_skew_angle(img: np.ndarray) -> float:
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        blur = cv2.GaussianBlur(gray, (9, 9), 0)
+        thresh = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)[1]
+        coords = np.column_stack(np.where(thresh > 0))
+        if len(coords) < 50:
+            return 0.0
+        rect = cv2.minAreaRect(coords)
+        angle = rect[-1]
+        if angle < -45:
+            angle = 90 + angle
+        elif angle > 45:
+            angle = angle - 90
+        return round(angle, 2)
+
+
+class DocumentAnalyzer:
+    """Extracts document metadata including skew angle."""
+
+    def analyze(self, img: Image.Image) -> dict:
+        cv_img = pil_to_cv(img)
+        h, w = cv_img.shape[:2]
+        gray = cv2.cvtColor(cv_img, cv2.COLOR_BGR2GRAY)
+        dark_ratio = float(np.sum(gray < 128)) / gray.size * 100
+
+        if dark_ratio > 15:
+            doc_type = "Text-heavy document"
+        elif dark_ratio > 5:
+            doc_type = "Mixed text/graphic document"
+        else:
+            doc_type = "Image/graphic-heavy document"
+
+        skew = ImageEnhancer.detect_skew_angle(cv_img)
+
+        return {
+            "orientation": "Portrait" if h > w else "Landscape",
+            "aspect_ratio": round(w / h, 2) if h else 0,
+            "text_density_pct": round(dark_ratio, 1),
+            "estimated_type": doc_type,
+            "skew_angle_deg": skew,
+        }
+
+
+class PDFLoader:
+    """Converts PDF bytes to PIL images."""
+
+    def load(self, pdf_bytes: bytes, scale: float = 2.0) -> list[Image.Image]:
+        pdf = pdfium.PdfDocument(pdf_bytes)
+        return [pdf[i].render(scale=scale).to_pil() for i in range(len(pdf))]
+
+
+class QualityGate:
+    """Decides if an image is ready for extraction."""
+
+    MIN_TEXT_DENSITY = 2.0
+    MAX_SKEW_ANGLE = 5.0
+
+    def evaluate(self, qc: QualityReport, analysis: dict) -> tuple[bool, list[str]]:
+        reasons: list[str] = []
+        if not qc.passed:
+            reasons.extend(qc.issues)
+        if qc.readability == "Poor":
+            reasons.append("Readability is Poor")
+        if analysis.get("text_density_pct", 0) < self.MIN_TEXT_DENSITY:
+            reasons.append(f"Text density {analysis['text_density_pct']}% is too low")
+        skew = abs(analysis.get("skew_angle_deg", 0))
+        if skew > self.MAX_SKEW_ANGLE:
+            reasons.append(f"Skew angle {skew} exceeds {self.MAX_SKEW_ANGLE}")
+        return len(reasons) == 0, reasons
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# EXTRACTION ENGINES
+# ═══════════════════════════════════════════════════════════════════════
+
+
+def _run_subprocess(label: str, cmd: list[str]) -> tuple[str, int, str, str, float]:
+    """Run a command, return (label, exit_code, stdout, stderr, elapsed)."""
+    t0 = time.perf_counter()
+    env = os.environ.copy()
+    env["PYTHONIOENCODING"] = "utf-8"
+    proc = subprocess.run(
+        cmd, capture_output=True, text=True,
+        encoding="utf-8", errors="replace",
+        cwd=str(BASE_DIR), env=env,
+    )
+    elapsed = time.perf_counter() - t0
+    return label, proc.returncode, proc.stdout, proc.stderr, elapsed
+
+
+def call_vision_api(
+    image_base64: str,
+    api_key: str,
+    system_prompt: str,
+    user_prompt: str,
+    api_url: str = API_URL,
+    model: str = "gpt-4-vision-playground",
+    temperature: float = 0.2,
+) -> dict:
+    """Send a base64-encoded image to the Vision API and return the response."""
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key}",
+    }
+    payload = {
+        "model": model,
+        "temperature": temperature,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": user_prompt},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/jpeg;base64,{image_base64}"},
+                    },
+                ],
+            },
+        ],
+    }
+    resp = requests.post(api_url, headers=headers, json=payload, timeout=120)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def _call_gpt4o_mini(api_key: str, system_prompt: str, user_prompt: str) -> dict:
+    """Call GPT-4o-mini for text-to-text tasks (merge, comparison)."""
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key}",
+    }
+    payload = {
+        "model": "gpt-4o-mini",
+        "temperature": 0.2,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+    }
+    resp = requests.post(API_URL, headers=headers, json=payload, timeout=120)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def _parse_llm_json(response: dict) -> dict:
+    """Extract and parse JSON from an LLM response."""
+    content = ""
+    if "choices" in response and response["choices"]:
+        content = response["choices"][0].get("message", {}).get("content", "")
+
+    cleaned = content.strip()
+    if cleaned.startswith("```"):
+        cleaned = cleaned.split("\n", 1)[1] if "\n" in cleaned else cleaned
+        if cleaned.endswith("```"):
+            cleaned = cleaned[:-3]
+        cleaned = cleaned.strip()
+
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        return {"raw_llm_response": content}
+
+
+def _fill_template(template: dict, source: dict) -> None:
+    """Recursively fill template keys from source, keeping template structure."""
+    for key in template:
+        if key not in source:
+            continue
+        if isinstance(template[key], dict) and isinstance(source[key], dict):
+            _fill_template(template[key], source[key])
+        else:
+            template[key] = source[key]
+
+
+class ExtractionEngine:
+    """Runs document extraction in one of three modes."""
+
+    VISION_SYSTEM_PROMPT = (
+        "You are a document OCR and data extraction expert. "
+        "Extract ALL text and structured data from the provided document image. "
+        "Return the result as valid JSON with fields and their values."
+    )
+
+    VISION_USER_PROMPT = (
+        "Extract all text and data from this document image. "
+        "Return a JSON object with all fields, labels, values, "
+        "numbers, dates, and names found in the document. "
+        "Preserve the original language (Marathi/Hindi/English)."
+    )
+
+    def __init__(self, api_key: str = ""):
+        self._api_key = api_key or os.environ.get("CXAI_API_KEY", "")
+
+    def extract(
+        self,
+        input_path: Path,
+        mode: str = "combined",
+        lang: str = "mr",
+        vision_input: Path | None = None,
+    ) -> dict:
+        """Run extraction and return the full result dict.
+
+        Args:
+            input_path: Path to the PDF or image file.
+            mode: 'paddle', 'vision', or 'combined'.
+            lang: PaddleOCR language code.
+            vision_input: Optional separate input for Vision API
+                          (e.g. preprocessed image while PaddleOCR gets raw PDF).
+        """
+        t_total = time.perf_counter()
+        vision_path = vision_input or input_path
+
+        if mode == "paddle":
+            return self._paddle_only(input_path, lang, t_total)
+        elif mode == "vision":
+            return self._vision_only(vision_path, t_total)
+        else:
+            return self._combined(input_path, vision_path, lang, t_total)
+
+    def _paddle_only(self, input_path: Path, lang: str, t_start: float) -> dict:
+        ocr_out = OUTPUT_DIR / "ocr_output.json"
         cmd = [
-            self._python,
-            self._script,
-            "--input", input_path,
-            "--output", output_path,
+            PYTHON_312, PADDLE_SCRIPT,
+            "--input", str(input_path),
+            "--output", str(ocr_out),
             "--lang", lang,
         ]
-        if vision_input:
-            cmd.extend(["--vision-input", vision_input])
+        _, rc, stdout, stderr, elapsed = _run_subprocess("PaddleOCR", cmd)
 
+        if rc != 0:
+            return {
+                "status": "failed",
+                "error": f"PaddleOCR failed (exit {rc}): {stderr[-500:]}",
+                "merged_extraction": {},
+                "timing_seconds": {"total": round(time.perf_counter() - t_start, 2)},
+            }
+
+        ocr_data = {}
+        if ocr_out.exists():
+            with ocr_out.open("r", encoding="utf-8") as f:
+                ocr_data = json.load(f)
+
+        return {
+            "status": "ok",
+            "source_file": str(input_path),
+            "extraction_mode": "paddle",
+            "merged_extraction": ocr_data,
+            "timing_seconds": {
+                "paddleocr": round(elapsed, 2),
+                "total": round(time.perf_counter() - t_start, 2),
+            },
+        }
+
+    def _vision_only(self, input_path: Path, t_start: float) -> dict:
+        suffix = input_path.suffix.lower()
         t0 = time.perf_counter()
-        proc = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            cwd=str(self._base_dir),
-            env=env,
-        )
-        elapsed = time.perf_counter() - t0
-        return proc.returncode, elapsed, proc.stdout, proc.stderr
 
-    def load_result(self, json_path: str) -> dict:
-        p = Path(json_path)
-        if not p.exists():
-            return {}
-        with p.open("r", encoding="utf-8") as f:
-            return json.load(f)
+        if suffix == ".pdf":
+            img_b64 = pdf_page_to_base64(str(input_path))
+        elif suffix in (".jpg", ".jpeg", ".png", ".webp"):
+            img_b64 = image_to_base64(str(input_path))
+        else:
+            return {
+                "status": "failed",
+                "error": f"Unsupported file type: {suffix}",
+                "merged_extraction": {},
+                "timing_seconds": {"total": round(time.perf_counter() - t_start, 2)},
+            }
+
+        try:
+            response = call_vision_api(
+                image_base64=img_b64,
+                api_key=self._api_key,
+                system_prompt=self.VISION_SYSTEM_PROMPT,
+                user_prompt=self.VISION_USER_PROMPT,
+            )
+        except requests.exceptions.RequestException as exc:
+            return {
+                "status": "failed",
+                "error": f"Vision API error: {exc}",
+                "merged_extraction": {},
+                "timing_seconds": {"total": round(time.perf_counter() - t_start, 2)},
+            }
+
+        t_api = time.perf_counter() - t0
+
+        content = ""
+        if "choices" in response and response["choices"]:
+            content = response["choices"][0].get("message", {}).get("content", "")
+
+        vision_data = {
+            "extracted_content": content,
+            "usage": response.get("usage", {}),
+        }
+
+        return {
+            "status": "ok",
+            "source_file": str(input_path),
+            "extraction_mode": "vision",
+            "merged_extraction": vision_data,
+            "timing_seconds": {
+                "vision_api": round(t_api, 2),
+                "total": round(time.perf_counter() - t_start, 2),
+            },
+        }
+
+    def _combined(self, input_path: Path, vision_path: Path, lang: str, t_start: float) -> dict:
+        ocr_out = OUTPUT_DIR / "ocr_output.json"
+        vision_out_path = OUTPUT_DIR / "vision_output.json"
+
+        paddle_cmd = [
+            PYTHON_312, PADDLE_SCRIPT,
+            "--input", str(input_path),
+            "--output", str(ocr_out),
+            "--lang", lang,
+        ]
+
+        suffix = vision_path.suffix.lower()
+        if suffix == ".pdf":
+            get_vision_b64 = lambda: pdf_page_to_base64(str(vision_path))
+        elif suffix in (".jpg", ".jpeg", ".png", ".webp"):
+            get_vision_b64 = lambda: image_to_base64(str(vision_path))
+        else:
+            get_vision_b64 = None
+
+        # Run PaddleOCR subprocess and Vision API call in parallel
+        paddle_result = {}
+        vision_content = ""
+        t_parallel_start = time.perf_counter()
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            paddle_future = pool.submit(_run_subprocess, "PaddleOCR", paddle_cmd)
+
+            vision_future = None
+            if get_vision_b64 is not None:
+                def _vision_task():
+                    b64 = get_vision_b64()
+                    resp = call_vision_api(
+                        image_base64=b64,
+                        api_key=self._api_key,
+                        system_prompt=self.VISION_SYSTEM_PROMPT,
+                        user_prompt=self.VISION_USER_PROMPT,
+                    )
+                    content = ""
+                    if "choices" in resp and resp["choices"]:
+                        content = resp["choices"][0].get("message", {}).get("content", "")
+                    return content, time.perf_counter() - t_parallel_start
+
+                vision_future = pool.submit(_vision_task)
+
+            _, p_rc, _, p_stderr, p_elapsed = paddle_future.result()
+            paddle_ok = p_rc == 0
+
+            vision_ok = False
+            v_elapsed = 0.0
+            if vision_future:
+                try:
+                    vision_content, v_elapsed = vision_future.result()
+                    vision_ok = bool(vision_content)
+                except Exception as exc:
+                    log.error("Vision extraction failed: %s", exc)
+
+        t_parallel = time.perf_counter() - t_parallel_start
+
+        if not paddle_ok and not vision_ok:
+            return {
+                "status": "failed",
+                "error": "Both PaddleOCR and Vision API failed",
+                "merged_extraction": {},
+                "timing_seconds": {"total": round(time.perf_counter() - t_start, 2)},
+            }
+
+        ocr_data = {}
+        if paddle_ok and ocr_out.exists():
+            with ocr_out.open("r", encoding="utf-8") as f:
+                ocr_data = json.load(f)
+
+        ocr_text = ""
+        if ocr_data.get("pages"):
+            page = ocr_data["pages"][0]
+            ocr_text = json.dumps({
+                "combined_text": page.get("combined_text", ""),
+                "structured_fields": page.get("structured_fields", {}),
+                "stats": page.get("stats", {}),
+            }, ensure_ascii=False, indent=2)
+
+        # GPT-4o-mini merge
+        template_str = json.dumps(OUTPUT_TEMPLATE, ensure_ascii=False, indent=2)
+
+        merge_system = (
+            "You are a Maharashtra land record (\u0917\u093e\u0935 \u0928\u092e\u0941\u0928\u093e "
+            "\u0938\u093e\u0924 / 7-12 extract) data reconciliation expert.\n"
+            "You receive two OCR extractions of the SAME document \u2014 one from PaddleOCR (offline) "
+            "and one from GPT-4 Vision (online).\n\n"
+            "RULES:\n"
+            "1. Fill the EXACT JSON template below. Do NOT add, remove, or rename any keys.\n"
+            "2. For each field, pick the most accurate/complete value from either source.\n"
+            "3. If a field is not found in either source, set it to empty string \"\" or empty list [].\n"
+            "4. In 'source_comparison.fields_differing', list fields where the two sources disagree.\n"
+            "5. In 'source_comparison.paddle_only', list data found ONLY in PaddleOCR.\n"
+            "6. In 'source_comparison.vision_only', list data found ONLY in Vision.\n"
+            "7. Respond ONLY with valid JSON matching the template. No markdown fences.\n\n"
+            f"TEMPLATE:\n{template_str}"
+        )
+
+        merge_user = (
+            f"=== PaddleOCR Extraction ===\n{ocr_text}\n\n"
+            f"=== GPT-4 Vision Extraction ===\n{vision_content}\n\n"
+            "Fill the template with merged data from both sources."
+        )
+
+        t_gpt_start = time.perf_counter()
+        try:
+            gpt_resp = _call_gpt4o_mini(self._api_key, merge_system, merge_user)
+        except requests.exceptions.RequestException as exc:
+            return {
+                "status": "failed",
+                "error": f"GPT-4o-mini merge failed: {exc}",
+                "merged_extraction": ocr_data if paddle_ok else {"extracted_content": vision_content},
+                "timing_seconds": {"total": round(time.perf_counter() - t_start, 2)},
+            }
+        t_gpt = time.perf_counter() - t_gpt_start
+
+        merged_json = _parse_llm_json(gpt_resp)
+
+        validated = copy.deepcopy(OUTPUT_TEMPLATE)
+        if isinstance(merged_json, dict) and "raw_llm_response" not in merged_json:
+            _fill_template(validated, merged_json)
+        else:
+            validated = merged_json
+
+        return {
+            "status": "ok",
+            "source_file": str(input_path),
+            "extraction_mode": "combined",
+            "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+            "pipeline": {
+                "paddleocr": {"status": "ok" if paddle_ok else "failed", "elapsed_seconds": round(p_elapsed, 2)},
+                "vision_api": {"status": "ok" if vision_ok else "failed", "elapsed_seconds": round(v_elapsed, 2)},
+                "gpt4o_mini_merge": {"elapsed_seconds": round(t_gpt, 2), "usage": gpt_resp.get("usage", {})},
+            },
+            "merged_extraction": validated,
+            "timing_seconds": {
+                "parallel_extraction": round(t_parallel, 2),
+                "gpt_merge": round(t_gpt, 2),
+                "total": round(time.perf_counter() - t_start, 2),
+            },
+        }
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# COMPARATIVE ANALYZER (GPT-4o-mini comparison of two extractions)
+# ═══════════════════════════════════════════════════════════════════════
 
 
 class ComparativeAnalyzer:
     """Sends two extraction results to GPT-4o-mini for comparison."""
 
-    def __init__(self, api_url: str, api_key: str):
-        self._api_url = api_url
+    def __init__(self, api_key: str):
         self._api_key = api_key
 
     def compare(self, raw_extraction: dict, prep_extraction: dict) -> tuple[dict, float]:
@@ -108,20 +770,20 @@ class ComparativeAnalyzer:
 
         system_prompt = (
             "You are a document extraction quality analyst.\n"
-            "You receive two extractions of the SAME Maharashtra land record (गाव नमुना सात).\n"
+            "You receive two extractions of the SAME Maharashtra land record.\n"
             "- Source A: extracted from the RAW (unprocessed) PDF.\n"
-            "- Source B: extracted from a PREPROCESSED (enhanced) image of the same PDF.\n\n"
+            "- Source B: extracted from a PREPROCESSED (enhanced) image.\n\n"
             "Your job:\n"
             "1. Compare field by field. For each field that differs, show both values.\n"
-            "2. List fields that improved in Source B (more accurate/complete).\n"
-            "3. List fields that degraded in Source B (worse than A).\n"
+            "2. List fields that improved in Source B.\n"
+            "3. List fields that degraded in Source B.\n"
             "4. List fields only found in one source.\n"
             "5. Give an overall verdict: did preprocessing help, hurt, or make no difference?\n"
-            "6. Give a confidence percentage for each source's overall accuracy.\n"
-            "7. Respond ONLY with valid JSON. No markdown fences, no explanation.\n\n"
+            "6. Give a confidence percentage for each source's accuracy.\n"
+            "7. Respond ONLY with valid JSON. No markdown fences.\n\n"
             "Use this structure:\n"
             "{\n"
-            '  "field_comparison": {\"field_name\": {\"raw\": \"...\", \"preprocessed\": \"...\", \"verdict\": \"improved|degraded|same\"}},\n'
+            '  "field_comparison": {"field_name": {"raw": "...", "preprocessed": "...", "verdict": "improved|degraded|same"}},\n'
             '  "improved_fields": ["..."],\n'
             '  "degraded_fields": ["..."],\n'
             '  "raw_only_fields": ["..."],\n'
@@ -133,52 +795,173 @@ class ComparativeAnalyzer:
         )
 
         user_prompt = (
-            "=== Source A: RAW extraction ===\n"
-            f"{raw_str}\n\n"
-            "=== Source B: PREPROCESSED extraction ===\n"
-            f"{prep_str}\n\n"
+            f"=== Source A: RAW extraction ===\n{raw_str}\n\n"
+            f"=== Source B: PREPROCESSED extraction ===\n{prep_str}\n\n"
             "Compare these two extractions field by field."
         )
 
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {self._api_key}",
-        }
-        payload = {
-            "model": "gpt-4o-mini",
-            "temperature": 0.2,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-        }
-
         t0 = time.perf_counter()
-        resp = requests.post(self._api_url, headers=headers, json=payload, timeout=180)
-        resp.raise_for_status()
+        resp = _call_gpt4o_mini(self._api_key, system_prompt, user_prompt)
         elapsed = time.perf_counter() - t0
 
-        body = resp.json()
-        raw_content = ""
-        if "choices" in body and body["choices"]:
-            raw_content = body["choices"][0].get("message", {}).get("content", "")
-
-        cleaned = raw_content.strip()
-        if cleaned.startswith("```"):
-            cleaned = cleaned.split("\n", 1)[1] if "\n" in cleaned else cleaned
-            if cleaned.endswith("```"):
-                cleaned = cleaned[:-3]
-            cleaned = cleaned.strip()
-
-        try:
-            result = json.loads(cleaned)
-        except json.JSONDecodeError:
-            result = {"raw_llm_response": raw_content}
-
-        return result, elapsed
+        return _parse_llm_json(resp), elapsed
 
 
-# ── Streamlit UI ─────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════
+# BATCH PROCESSING (Queue system for UC1)
+# ═══════════════════════════════════════════════════════════════════════
+
+
+@dataclass
+class DocumentJob:
+    """One unit of work in the extraction queue."""
+    file_path: Path
+    filename: str
+    status: str = "pending"
+    extraction_mode: str = "combined"
+    result: dict | None = None
+    error: str = ""
+    processing_time_s: float = 0.0
+
+
+class UC1CSVResultStore:
+    """Appends extraction results to a CSV file with retry."""
+
+    def __init__(self, csv_path: Path):
+        self._path = csv_path
+        self._ensure_headers()
+
+    def _ensure_headers(self):
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        if not self._path.exists() or self._path.stat().st_size == 0:
+            self._write(self._path, "w", None, header=True)
+
+    def save(self, job: DocumentJob) -> None:
+        row = self._job_to_row(job)
+        self._write(self._path, "a", [row], header=False)
+
+    def _write(self, path: Path, mode: str, rows: list[dict] | None, header: bool):
+        for attempt in range(3):
+            try:
+                with open(path, mode, newline="", encoding="utf-8") as f:
+                    writer = csv.DictWriter(f, fieldnames=UC1_CSV_COLUMNS)
+                    if header:
+                        writer.writeheader()
+                    if rows:
+                        writer.writerows(rows)
+                return
+            except PermissionError:
+                if attempt < 2:
+                    time.sleep(1.0)
+                else:
+                    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    alt = path.with_stem(f"{path.stem}_{ts}")
+                    log.warning("CSV locked — writing to %s instead", alt.name)
+                    self._path = alt
+                    self._ensure_headers()
+                    if rows:
+                        with open(alt, "a", newline="", encoding="utf-8") as f:
+                            csv.DictWriter(f, fieldnames=UC1_CSV_COLUMNS).writerows(rows)
+
+    @staticmethod
+    def _job_to_row(job: DocumentJob) -> dict[str, Any]:
+        row: dict[str, Any] = {
+            "filename": job.filename,
+            "extraction_mode": job.extraction_mode,
+            "status": job.status,
+            "processing_time_s": round(job.processing_time_s, 2),
+            "processed_at_utc": datetime.now(timezone.utc).isoformat(),
+        }
+
+        if job.status == "failed" or job.result is None:
+            row["status"] = "ERROR"
+            return row
+
+        merged = job.result.get("merged_extraction", {})
+        row["document_type"] = merged.get("document_type", "")
+        row["state"] = merged.get("state", "")
+        row["district"] = merged.get("district", "")
+        row["taluka"] = merged.get("taluka", "")
+        row["village"] = merged.get("village", "")
+        row["survey_number"] = merged.get("survey_number", "")
+
+        owner = merged.get("owner", {})
+        row["owner_name"] = owner.get("name", "") if isinstance(owner, dict) else ""
+
+        area = merged.get("area", {})
+        row["total_area_hectare"] = area.get("total_area_hectare", "") if isinstance(area, dict) else ""
+
+        filled, empty = _count_fields(merged)
+        row["fields_filled"] = filled
+        row["fields_total"] = filled + empty
+
+        return row
+
+
+class UC1BatchProcessor:
+    """Processes documents through the extraction pipeline via queue."""
+
+    def __init__(self, engine: ExtractionEngine, store: UC1CSVResultStore, mode: str = "combined"):
+        self._engine = engine
+        self._store = store
+        self._mode = mode
+        self._queue: Queue[DocumentJob] = Queue()
+        self._completed: list[DocumentJob] = []
+
+    @property
+    def queue_size(self) -> int:
+        return self._queue.qsize()
+
+    @property
+    def completed_jobs(self) -> list[DocumentJob]:
+        return list(self._completed)
+
+    def enqueue_file(self, file_path: Path) -> DocumentJob:
+        job = DocumentJob(file_path=file_path, filename=file_path.name, extraction_mode=self._mode)
+        self._queue.put(job)
+        return job
+
+    def enqueue_folder(self, folder: Path) -> list[DocumentJob]:
+        jobs = []
+        for ext in ("*.pdf", "*.jpg", "*.jpeg", "*.png"):
+            for p in sorted(folder.glob(ext)):
+                jobs.append(self.enqueue_file(p))
+        log.info("Enqueued %d files from %s", len(jobs), folder)
+        return jobs
+
+    def process_all(self, callback=None) -> list[DocumentJob]:
+        total = self._queue.qsize()
+        index = 0
+        while not self._queue.empty():
+            job = self._queue.get()
+            index += 1
+            job.status = "processing"
+            log.info("[%d/%d] Processing %s (%s)", index, total, job.filename, job.extraction_mode)
+
+            t0 = time.perf_counter()
+            try:
+                job.result = self._engine.extract(
+                    input_path=job.file_path,
+                    mode=job.extraction_mode,
+                )
+                job.status = job.result.get("status", "ok")
+            except Exception as exc:
+                log.error("Failed to process %s: %s", job.filename, exc)
+                job.status = "failed"
+                job.error = str(exc)
+            job.processing_time_s = time.perf_counter() - t0
+
+            self._store.save(job)
+            self._completed.append(job)
+            if callback:
+                callback(job, index, total)
+
+        return self._completed
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# STREAMLIT UI — SINGLE MODE
+# ═══════════════════════════════════════════════════════════════════════
 
 
 def _render_quality(qc: QualityReport):
@@ -189,60 +972,20 @@ def _render_quality(qc: QualityReport):
     st.metric("Readability", qc.readability)
 
 
-def _run_pipeline_thread(
-    label: str,
-    runner: PipelineRunner,
-    input_path: str,
-    output_path: str,
-    lang: str,
-    vision_input: str | None = None,
-) -> tuple[str, int, float, str, str]:
-    rc, elapsed, stdout, stderr = runner.run(
-        input_path, output_path, lang, vision_input=vision_input
-    )
-    return label, rc, elapsed, stdout, stderr
-
-
-def main():
-    st.set_page_config(
-        page_title="DocExtract — Comparative Analysis",
-        page_icon="📊",
-        layout="wide",
-    )
-
-    st.markdown(
-        "<h1 style='text-align:center;'>DocExtract — Comparative Analysis</h1>"
-        "<p style='text-align:center;color:#666;'>"
-        "Raw vs Preprocessed extraction &mdash; side-by-side comparison"
-        "</p><hr>",
-        unsafe_allow_html=True,
-    )
-
-    api_key = os.environ.get("CXAI_API_KEY", "")
-    if not api_key or api_key == "your_api_key_here":
-        st.error("Set CXAI_API_KEY in `.env` file first.")
-        return
-
+def _single_mode(api_key: str):
+    """Upload one document, preprocess, run extraction pipeline, review."""
     checker = QualityChecker()
     enhancer = ImageEnhancer()
     analyzer = DocumentAnalyzer()
     loader = PDFLoader()
     gate = QualityGate()
-    runner = PipelineRunner(PYTHON_312, COMBINED_SCRIPT, BASE_DIR)
-    comparator = ComparativeAnalyzer(API_URL, api_key)
+    comparator = ComparativeAnalyzer(api_key)
 
     for key, default in [
-        ("step", 1),
-        ("approved", False),
-        ("prep_path", None),
-        ("preprocessing_skipped", False),
-        ("force_preprocess", False),
-        ("raw_json_path", None),
-        ("prep_json_path", None),
-        ("raw_result", None),
-        ("prep_result", None),
-        ("comparison", None),
-        ("final_saved", False),
+        ("step", 1), ("approved", False), ("prep_path", None),
+        ("preprocessing_skipped", False), ("force_preprocess", False),
+        ("raw_result", None), ("prep_result", None),
+        ("comparison", None), ("final_saved", False),
     ]:
         if key not in st.session_state:
             st.session_state[key] = default
@@ -257,13 +1000,11 @@ def main():
     # ── Tab 1: Upload & Preprocess ───────────────────────────────
     with tab1:
         st.subheader("Upload & Preprocess")
-
         uploaded = st.file_uploader(
             "Upload PDF or Image",
             type=["pdf", "png", "jpg", "jpeg", "webp"],
             key="pipeline_upload",
         )
-
         if not uploaded:
             st.info("Upload a document to begin.")
             return
@@ -280,12 +1021,10 @@ def main():
         if suffix == ".pdf":
             with st.spinner("Rendering PDF..."):
                 images = loader.load(file_bytes)
-            page_idx = 0
-            original = images[page_idx]
+            original = images[0]
         else:
             original = Image.open(io.BytesIO(file_bytes)).convert("RGB")
 
-        # ── Quality gate on RAW image first ───────────────────────
         raw_qc = checker.check(original)
         raw_analysis = analyzer.analyze(original)
         raw_passed, raw_reasons = gate.evaluate(raw_qc, raw_analysis)
@@ -293,33 +1032,26 @@ def main():
         if raw_passed and not st.session_state.get("force_preprocess"):
             st.success(
                 f"**Raw Quality Gate: PASSED** | Sharpness: {raw_qc.sharpness} "
-                f"| Readability: {raw_qc.readability} | Skew: {raw_analysis['skew_angle_deg']}°"
+                f"| Readability: {raw_qc.readability} | Skew: {raw_analysis['skew_angle_deg']}"
             )
-            st.info(
-                "The raw document already meets quality standards. "
-                "Preprocessing is **not needed** — skipping to pipeline."
-            )
-            st.image(original, caption="Original (no preprocessing needed)", width="stretch")
+            st.image(original, caption="Original (no preprocessing needed)", use_container_width=True)
 
             col_skip, col_force = st.columns(2)
             with col_skip:
-                if st.button("Skip Preprocessing & Run Pipelines", type="primary", width="stretch"):
+                if st.button("Skip Preprocessing & Run Pipelines", type="primary", use_container_width=True):
                     st.session_state.approved = True
                     st.session_state.prep_path = None
                     st.session_state.preprocessing_skipped = True
                     st.session_state.step = 2
                     st.rerun()
             with col_force:
-                if st.button("Preprocess Anyway", width="stretch"):
+                if st.button("Preprocess Anyway", use_container_width=True):
                     st.session_state.force_preprocess = True
                     st.rerun()
             return
 
-        # ── Show enhancement controls (raw failed OR user forced) ─
         if not raw_passed:
-            st.warning(
-                f"**Raw Quality Gate: FAILED** — preprocessing recommended."
-            )
+            st.warning("**Raw Quality Gate: FAILED** — preprocessing recommended.")
             for r in raw_reasons:
                 st.markdown(f"- {r}")
             st.divider()
@@ -331,8 +1063,7 @@ def main():
             contrast = st.slider("Contrast", 0.5, 3.0, 1.5, 0.1, key="p_contrast")
             brightness = st.slider("Brightness", 0.5, 2.0, 1.1, 0.1, key="p_brightness")
             denoise = st.radio(
-                "Denoise",
-                ["nlm", "median", "none"],
+                "Denoise", ["nlm", "median", "none"],
                 format_func={"nlm": "Non-local means", "median": "Median", "none": "None"}.get,
                 key="p_denoise",
             )
@@ -340,22 +1071,18 @@ def main():
             do_thresh = st.checkbox("Adaptive threshold", key="p_thresh")
 
         enhanced = enhancer.enhance(
-            original,
-            contrast=contrast,
-            brightness=brightness,
-            denoise_method=denoise,
-            deskew=do_deskew,
-            adaptive_thresh=do_thresh,
+            original, contrast=contrast, brightness=brightness,
+            denoise_method=denoise, deskew=do_deskew, adaptive_thresh=do_thresh,
         )
 
         with col_preview:
             c1, c2 = st.columns(2)
             with c1:
                 st.caption("Original")
-                st.image(original, width="stretch")
+                st.image(original, use_container_width=True)
             with c2:
                 st.caption("Enhanced")
-                st.image(enhanced, width="stretch")
+                st.image(enhanced, use_container_width=True)
 
         qc = checker.check(enhanced)
         analysis = analyzer.analyze(enhanced)
@@ -364,16 +1091,15 @@ def main():
         st.divider()
 
         if passed:
-            st.success(f"**Quality Gate: PASSED** | Sharpness: {qc.sharpness} | Readability: {qc.readability} | Skew: {analysis['skew_angle_deg']}°")
-
-            if st.button("Approve & Proceed to Pipelines", type="primary", width="stretch"):
+            st.success(f"**Quality Gate: PASSED** | Sharpness: {qc.sharpness} | Readability: {qc.readability}")
+            if st.button("Approve & Proceed to Pipelines", type="primary", use_container_width=True):
                 prep_path = UPLOAD_DIR / f"preprocessed_{Path(uploaded.name).stem}.png"
                 enhanced.save(str(prep_path), format="PNG")
                 st.session_state.approved = True
                 st.session_state.prep_path = str(prep_path)
                 st.session_state.preprocessing_skipped = False
                 st.session_state.step = 2
-                st.success(f"Saved preprocessed image. Go to **Run Pipelines** tab.")
+                st.success("Saved preprocessed image. Go to **Run Pipelines** tab.")
         else:
             st.error("**Quality Gate: FAILED**")
             for r in reasons:
@@ -383,7 +1109,6 @@ def main():
     # ── Tab 2: Run Pipelines ─────────────────────────────────────
     with tab2:
         st.subheader("Run Extraction Pipelines")
-
         if not st.session_state.approved:
             st.warning("Complete Step 1 first — approve the preprocessed image.")
             return
@@ -395,115 +1120,76 @@ def main():
         raw_out = str(OUTPUT_DIR / "raw_combined.json")
         prep_out = str(OUTPUT_DIR / "prep_combined.json")
 
+        engine = ExtractionEngine(api_key=api_key)
+
         if skipped:
-            st.info(
-                "Preprocessing was **skipped** (raw quality gate passed). "
-                "Running single pipeline on the raw document."
-            )
-            st.markdown(
-                f"- **Pipeline:** `{Path(raw_path).name}` → PaddleOCR + Vision → `raw_combined.json`"
-            )
+            st.info("Preprocessing was **skipped** (raw quality gate passed). Running single pipeline.")
         else:
             st.markdown(
-                f"- **Path A (Raw):** `{Path(raw_path).name}` → PaddleOCR + Vision on raw PDF → `raw_combined.json`\n"
-                f"- **Path B (Preprocessed):** PaddleOCR on raw PDF + Vision on `{Path(prep_path).name}` → `prep_combined.json`"
+                f"- **Path A (Raw):** `{Path(raw_path).name}` -> Combined pipeline -> `raw_combined.json`\n"
+                f"- **Path B (Preprocessed):** PaddleOCR on raw PDF + Vision on `{Path(prep_path).name}` -> `prep_combined.json`"
             )
 
         btn_label = "Run Pipeline" if skipped else "Run Both Pipelines"
-        if st.button(btn_label, type="primary", width="stretch"):
-            status_msg = "Running pipeline..." if skipped else "Running both pipelines in parallel..."
+        if st.button(btn_label, type="primary", use_container_width=True):
             t_wall_start = time.perf_counter()
 
-            results = {}
-            with st.status(status_msg, expanded=True) as status_widget:
-                with ThreadPoolExecutor(max_workers=2) as pool:
-                    futures = {
-                        pool.submit(
-                            _run_pipeline_thread, "Raw", runner,
-                            raw_path, raw_out, "mr",
-                        ): "raw",
-                    }
-                    if not skipped:
-                        futures[pool.submit(
-                            _run_pipeline_thread, "Preprocessed", runner,
-                            raw_path, prep_out, "mr",
-                            vision_input=prep_path,
-                        )] = "prep"
+            with st.status("Running extraction...", expanded=True) as status_widget:
+                raw_result = engine.extract(Path(raw_path), mode="combined")
+                st.session_state.raw_result = raw_result
 
-                    for future in as_completed(futures):
-                        label, rc, elapsed, stdout, stderr = future.result()
-                        results[label] = {"rc": rc, "elapsed": elapsed, "stderr": stderr}
-                        if rc == 0:
-                            st.write(f":white_check_mark: **{label}:** OK ({elapsed:.1f}s)")
-                        else:
-                            st.write(f":x: **{label}:** FAILED ({elapsed:.1f}s)")
+                with Path(raw_out).open("w", encoding="utf-8") as fp:
+                    json.dump(raw_result, fp, ensure_ascii=False, indent=2)
+
+                if raw_result.get("status") == "ok":
+                    st.write(f":white_check_mark: **Raw pipeline:** OK ({raw_result['timing_seconds']['total']:.1f}s)")
+                else:
+                    st.write(f":x: **Raw pipeline:** FAILED")
+
+                if not skipped:
+                    prep_result = engine.extract(
+                        Path(raw_path), mode="combined",
+                        vision_input=Path(prep_path),
+                    )
+                    st.session_state.prep_result = prep_result
+
+                    with Path(prep_out).open("w", encoding="utf-8") as fp:
+                        json.dump(prep_result, fp, ensure_ascii=False, indent=2)
+
+                    if prep_result.get("status") == "ok":
+                        st.write(f":white_check_mark: **Preprocessed pipeline:** OK ({prep_result['timing_seconds']['total']:.1f}s)")
+                    else:
+                        st.write(f":x: **Preprocessed pipeline:** FAILED")
 
                 total_wall = time.perf_counter() - t_wall_start
                 status_widget.update(
                     label=f"Pipeline{'s' if not skipped else ''} finished in {total_wall:.1f}s",
-                    state="complete",
-                    expanded=False,
+                    state="complete", expanded=False,
                 )
 
-            raw_ok = results.get("Raw", {}).get("rc") == 0
-            prep_ok = results.get("Preprocessed", {}).get("rc") == 0 if not skipped else False
-
-            if not raw_ok:
-                st.expander("Raw pipeline stderr").code(results["Raw"]["stderr"][-1000:])
-            if not skipped and not prep_ok:
-                st.expander("Preprocessed pipeline stderr").code(
-                    results["Preprocessed"]["stderr"][-1000:]
-                )
-
-            if raw_ok or prep_ok:
-                st.session_state.raw_json_path = raw_out if raw_ok else None
-                st.session_state.prep_json_path = prep_out if prep_ok else None
-                st.session_state.raw_result = runner.load_result(raw_out) if raw_ok else {}
-                st.session_state.prep_result = runner.load_result(prep_out) if prep_ok else {}
-                st.session_state.step = 3
-
-                st.divider()
-                if skipped:
-                    raw_elapsed = results.get("Raw", {}).get("elapsed", 0)
-                    st.metric("Pipeline Time", f"{raw_elapsed:.1f}s")
-                    st.success("Pipeline complete. Go to **Comparative Analysis** tab (raw-only mode).")
-                else:
-                    raw_elapsed = results.get("Raw", {}).get("elapsed", 0)
-                    prep_elapsed = results.get("Preprocessed", {}).get("elapsed", 0)
-                    c1, c2 = st.columns(2)
-                    c1.metric("Raw Pipeline", f"{raw_elapsed:.1f}s")
-                    c2.metric("Preprocessed Pipeline", f"{prep_elapsed:.1f}s")
-                    st.success("Both pipelines complete. Go to **Comparative Analysis** tab.")
-            else:
-                st.error("Pipeline failed. Check errors above.")
+            st.session_state.step = 3
+            st.success("Pipelines complete. Go to **Comparative Analysis** tab.")
 
     # ── Tab 3: Comparative Analysis ──────────────────────────────
     with tab3:
         st.subheader("Comparative Analysis")
-
         raw_result = st.session_state.raw_result
         prep_result = st.session_state.prep_result
-        skipped = st.session_state.preprocessing_skipped
+        skipped_cmp = st.session_state.preprocessing_skipped
 
-        if not raw_result and not prep_result:
+        if not raw_result:
             st.warning("Complete Step 2 first — run the pipeline(s).")
             return
 
-        raw_ext = raw_result.get("merged_extraction", {}) if raw_result else {}
+        raw_ext = raw_result.get("merged_extraction", {})
         prep_ext = prep_result.get("merged_extraction", {}) if prep_result else {}
 
-        if skipped:
-            st.info(
-                "Preprocessing was skipped (raw quality gate passed). "
-                "Showing raw extraction only — no comparison needed."
-            )
-            st.markdown("**Extraction Result**")
+        if skipped_cmp:
+            st.info("Preprocessing was skipped. Showing raw extraction only.")
             st.json(raw_ext)
-
             st.session_state.comparison = {
                 "mode": "raw_only",
                 "note": "Preprocessing skipped — raw quality gate passed",
-                "raw_accuracy_pct": "N/A (single path)",
             }
             st.session_state.step = 4
             st.success("Go to **Final Output** tab to save results.")
@@ -518,24 +1204,15 @@ def main():
 
             st.divider()
 
-            if st.button("Run GPT-4o-mini Comparison", type="primary", width="stretch"):
+            if st.button("Run GPT-4o-mini Comparison", type="primary", use_container_width=True):
                 with st.spinner("Analyzing differences with GPT-4o-mini..."):
-                    try:
-                        comparison, comp_elapsed = comparator.compare(raw_ext, prep_ext)
-                    except requests.exceptions.HTTPError as exc:
-                        st.error(f"API error: {exc.response.status_code}")
-                        return
-                    except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
-                        st.error("Could not connect to API. Check network/VPN.")
-                        return
-
+                    comparison, comp_elapsed = comparator.compare(raw_ext, prep_ext)
                 st.session_state.comparison = comparison
                 st.session_state.comp_elapsed = comp_elapsed
                 st.session_state.step = 4
 
             if st.session_state.comparison and st.session_state.comparison.get("mode") != "raw_only":
                 comp = st.session_state.comparison
-
                 if "raw_llm_response" not in comp:
                     verdict = comp.get("overall_verdict", "N/A")
                     raw_acc = comp.get("raw_accuracy_pct", "?")
@@ -549,11 +1226,10 @@ def main():
 
                     improved = comp.get("improved_fields", [])
                     degraded = comp.get("degraded_fields", [])
-
                     if improved:
-                        st.success(f"**Improved fields ({len(improved)}):** {', '.join(improved)}")
+                        st.success(f"**Improved ({len(improved)}):** {', '.join(improved)}")
                     if degraded:
-                        st.error(f"**Degraded fields ({len(degraded)}):** {', '.join(degraded)}")
+                        st.error(f"**Degraded ({len(degraded)}):** {', '.join(degraded)}")
 
                     field_comp = comp.get("field_comparison", {})
                     if field_comp:
@@ -565,76 +1241,260 @@ def main():
                     st.warning("LLM returned non-JSON. Raw response:")
                     st.code(comp.get("raw_llm_response", ""))
 
-    # ── Tab 4: Final Output & Verification ──────────────────────
+    # ── Tab 4: Final Output ──────────────────────────────────────
     with tab4:
-        st.subheader("Final Output & Verification")
-
+        st.subheader("Final Output")
         if not st.session_state.comparison:
-            st.warning("Complete Step 3 first — run the comparative analysis.")
+            st.warning("Complete Step 3 first.")
             return
 
-        skipped_final = st.session_state.preprocessing_skipped
-
+        skipped_fin = st.session_state.preprocessing_skipped
         final = {
             "source_file": str(UPLOAD_DIR / f"raw_{uploaded.name}") if uploaded else "",
             "generated_at_utc": datetime.now(timezone.utc).isoformat(),
-            "preprocessing_skipped": skipped_final,
-            "raw_extraction": st.session_state.raw_result.get("merged_extraction", {}) if st.session_state.raw_result else {},
+            "preprocessing_skipped": skipped_fin,
+            "raw_extraction": st.session_state.raw_result.get("merged_extraction", {}),
         }
-
-        if not skipped_final:
-            final["preprocessed_extraction"] = (
-                st.session_state.prep_result.get("merged_extraction", {})
-                if st.session_state.prep_result else {}
-            )
+        if not skipped_fin and st.session_state.prep_result:
+            final["preprocessed_extraction"] = st.session_state.prep_result.get("merged_extraction", {})
             final["comparative_analysis"] = st.session_state.comparison
-            final["timing_seconds"] = {
-                "raw_pipeline": st.session_state.raw_result.get("timing_seconds", {}).get("total", 0) if st.session_state.raw_result else 0,
-                "preprocessed_pipeline": st.session_state.prep_result.get("timing_seconds", {}).get("total", 0) if st.session_state.prep_result else 0,
-                "comparison": getattr(st.session_state, "comp_elapsed", 0),
-            }
-        else:
-            final["note"] = "Preprocessing skipped — raw quality gate passed. Single-path extraction."
-            final["timing_seconds"] = {
-                "raw_pipeline": st.session_state.raw_result.get("timing_seconds", {}).get("total", 0) if st.session_state.raw_result else 0,
-            }
 
         st.json(final)
 
         out_path = OUTPUT_DIR / "comparative_output.json"
+        if st.button("Save to JSON", type="primary", use_container_width=True):
+            with out_path.open("w", encoding="utf-8") as fp:
+                json.dump(final, fp, ensure_ascii=False, indent=2)
+            st.session_state.final_saved = True
+            st.success(f"Saved to `{out_path.resolve()}`")
+            st.balloons()
 
-        col_save, col_verify = st.columns(2)
 
-        with col_save:
-            if st.button("Save to JSON", type="secondary", use_container_width=True):
-                with out_path.open("w", encoding="utf-8") as fp:
-                    json.dump(final, fp, ensure_ascii=False, indent=2)
-                st.session_state.final_saved = True
-                st.success(f"Saved to `{out_path.resolve()}`")
+# ═══════════════════════════════════════════════════════════════════════
+# STREAMLIT UI — BATCH MODE
+# ═══════════════════════════════════════════════════════════════════════
 
-        with col_verify:
-            if st.button("Proceed to Verification & Approval", type="primary", use_container_width=True):
-                with out_path.open("w", encoding="utf-8") as fp:
-                    json.dump(final, fp, ensure_ascii=False, indent=2)
-                st.session_state.final_saved = True
-                st.success(
-                    "Extraction saved. Open the **Verification UI** to review and approve:\n\n"
-                    "```\nstreamlit run verify_ui.py\n```"
-                )
-                st.balloons()
 
-        if st.session_state.final_saved:
-            st.divider()
-            st.markdown("### Next Steps")
-            st.markdown(
-                "1. **Verify & Approve** — run `streamlit run verify_ui.py` to review extracted fields, "
-                "make corrections, and approve the document.\n"
-                "2. **Egress API** — run `python app.py` to start the FastAPI server, then call:\n"
-                "   ```\n"
-                "   GET http://localhost:8000/egress/{document_id}\n"
-                "   ```\n"
-                "3. **List verified documents** — `GET http://localhost:8000/documents`"
-            )
+def _batch_mode(api_key: str):
+    """Upload or scan multiple documents, process via queue, show live table."""
+    for key in ("batch_jobs", "batch_results_df", "batch_sources"):
+        if key not in st.session_state:
+            st.session_state[key] = None
+
+    col_upload, col_folder = st.columns(2)
+
+    with col_upload:
+        st.subheader("Upload Documents")
+        uploaded_files = st.file_uploader(
+            "Upload one or more PDFs/images",
+            type=["pdf", "png", "jpg", "jpeg"],
+            accept_multiple_files=True,
+            key="batch_upload_uc1",
+        )
+
+    with col_folder:
+        st.subheader("Or scan a local folder")
+        folder_path = st.text_input(
+            "Folder path containing documents",
+            value="uploads",
+            help="Relative or absolute path to a folder with PDFs/images",
+            key="uc1_folder_path",
+        )
+        if st.button("Scan Folder", key="uc1_scan_folder"):
+            fp = Path(folder_path)
+            if fp.is_dir():
+                found = []
+                for ext in ("*.pdf", "*.jpg", "*.jpeg", "*.png"):
+                    for p in sorted(fp.glob(ext)):
+                        found.append((p.name, p))
+                st.session_state.batch_sources = found
+                st.session_state.batch_results_df = None
+                st.session_state.batch_jobs = None
+            else:
+                st.error(f"Folder not found: `{folder_path}`")
+
+    if uploaded_files:
+        upload_list = []
+        for uf in uploaded_files:
+            upload_list.append((uf.name, uf.read()))
+        st.session_state.batch_sources = upload_list
+
+    st.divider()
+
+    extraction_mode = st.radio(
+        "Extraction Mode",
+        ["combined", "paddle", "vision"],
+        format_func={"combined": "Combined (PaddleOCR + Vision + GPT-4o-mini)",
+                      "paddle": "PaddleOCR Only (offline)",
+                      "vision": "Vision API Only"}.get,
+        horizontal=True,
+        key="uc1_extraction_mode",
+    )
+
+    batch_sources = st.session_state.batch_sources
+    if batch_sources:
+        st.success(f"**{len(batch_sources)} documents** ready for processing")
+
+        if st.button("Process All Documents", type="primary", use_container_width=True):
+            _run_batch_uc1(batch_sources, api_key, extraction_mode)
+
+    if st.session_state.batch_results_df is not None:
+        st.divider()
+        _render_batch_results_uc1()
+
+
+def _run_batch_uc1(sources: list[tuple[str, "Path | bytes"]], api_key: str, mode: str):
+    """Process all documents with live-updating results table."""
+    engine = ExtractionEngine(api_key=api_key)
+    output_csv = Path("output/uc1_extraction_results.csv")
+    store = UC1CSVResultStore(csv_path=output_csv)
+    processor = UC1BatchProcessor(engine=engine, store=store, mode=mode)
+
+    tmp_dir = Path(tempfile.mkdtemp(prefix="uc1_batch_"))
+    file_paths: list[Path] = []
+    for name, source in sources:
+        if isinstance(source, Path):
+            file_paths.append(source)
+        else:
+            dest = tmp_dir / name
+            dest.write_bytes(source)
+            file_paths.append(dest)
+
+    for fp in file_paths:
+        processor.enqueue_file(fp)
+
+    total = processor.queue_size
+    progress_bar = st.progress(0, text=f"Processing 0/{total}...")
+
+    m_col1, m_col2, m_col3 = st.columns(3)
+    m_total = m_col1.empty()
+    m_ok = m_col2.empty()
+    m_err = m_col3.empty()
+
+    table_placeholder = st.empty()
+    live_rows: list[dict] = []
+    completed_jobs: list[DocumentJob] = []
+
+    def on_complete(job: DocumentJob, index: int, total: int):
+        progress_bar.progress(
+            index / total,
+            text=f"Processing {index}/{total} — {job.filename}: {job.status}",
+        )
+
+        row = UC1CSVResultStore._job_to_row(job)
+        live_rows.append(row)
+        completed_jobs.append(job)
+
+        df = pd.DataFrame(live_rows)
+        ok_count = len(df[df["status"] == "ok"])
+        err_count = len(df[df["status"] != "ok"])
+
+        m_total.metric("Processed", f"{index}/{total}")
+        m_ok.metric("Succeeded", ok_count)
+        m_err.metric("Errors", err_count)
+
+        display_cols = [
+            "filename", "extraction_mode", "status",
+            "district", "taluka", "village", "survey_number",
+            "owner_name", "total_area_hectare", "fields_filled",
+        ]
+        available = [c for c in display_cols if c in df.columns]
+        table_placeholder.dataframe(
+            df[available], use_container_width=True,
+            height=min(400, 50 + 35 * len(df)),
+        )
+
+    processor.process_all(callback=on_complete)
+    progress_bar.progress(1.0, text=f"Done — {total} documents processed")
+
+    df = pd.DataFrame(live_rows)
+    st.session_state.batch_results_df = df
+    st.session_state.batch_jobs = completed_jobs
+
+    ok_count = len(df[df["status"] == "ok"])
+    st.success(f"Batch complete: **{ok_count}/{len(df)}** succeeded.")
+
+
+def _render_batch_results_uc1():
+    """Render batch results with filtering, CSV download, and inspection."""
+    st.subheader("Extraction Results")
+
+    df = st.session_state.batch_results_df
+
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Total", len(df))
+    col2.metric("Succeeded", len(df[df["status"] == "ok"]))
+    col3.metric("Errors", len(df[df["status"] != "ok"]))
+
+    st.dataframe(df, use_container_width=True, height=400)
+
+    st.divider()
+
+    csv_buffer = io.StringIO()
+    df.to_csv(csv_buffer, index=False)
+    st.download_button(
+        label="Download Results CSV",
+        data=csv_buffer.getvalue(),
+        file_name="uc1_extraction_results.csv",
+        mime="text/csv",
+        use_container_width=True,
+    )
+
+    st.divider()
+    st.subheader("Inspect Individual Results")
+
+    jobs = st.session_state.batch_jobs
+    if jobs:
+        for job in jobs:
+            icon = "+" if job.status == "ok" else "-"
+            with st.expander(f"[{icon}] {job.filename} -- {job.status} ({job.processing_time_s:.1f}s)"):
+                if job.result:
+                    merged = job.result.get("merged_extraction", {})
+                    st.json(merged)
+                    timing = job.result.get("timing_seconds", {})
+                    if timing:
+                        st.caption(f"Timing: {json.dumps(timing)}")
+                if job.error:
+                    st.error(job.error)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# MAIN ENTRY POINT
+# ═══════════════════════════════════════════════════════════════════════
+
+
+def main():
+    st.set_page_config(
+        page_title="DocExtract — Land Record OCR",
+        page_icon="📄",
+        layout="wide",
+    )
+
+    st.markdown(
+        "<h1 style='text-align:center;'>DocExtract — Land Record OCR & Extraction</h1>"
+        "<p style='text-align:center;color:#666;'>"
+        "Single or batch document extraction &mdash; PaddleOCR / Vision / Combined"
+        "</p><hr>",
+        unsafe_allow_html=True,
+    )
+
+    api_key = os.environ.get("CXAI_API_KEY", "")
+    if not api_key:
+        st.warning("**CXAI_API_KEY** not found in `.env`. Vision and Combined modes require this key.")
+
+    mode = st.radio(
+        "Processing Mode",
+        ["Single Document", "Batch Processing"],
+        horizontal=True,
+        key="uc1_mode",
+    )
+
+    st.divider()
+
+    if mode == "Single Document":
+        _single_mode(api_key)
+    else:
+        _batch_mode(api_key)
 
 
 if __name__ == "__main__":
