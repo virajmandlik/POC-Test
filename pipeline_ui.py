@@ -565,9 +565,9 @@ def main():
                     st.warning("LLM returned non-JSON. Raw response:")
                     st.code(comp.get("raw_llm_response", ""))
 
-    # ── Tab 4: Final Output ──────────────────────────────────────
+    # ── Tab 4: Final Output & Verification ──────────────────────
     with tab4:
-        st.subheader("Final Output")
+        st.subheader("Final Output & Verification")
 
         if not st.session_state.comparison:
             st.warning("Complete Step 3 first — run the comparative analysis.")
@@ -603,12 +603,38 @@ def main():
 
         out_path = OUTPUT_DIR / "comparative_output.json"
 
-        if st.button("Save to JSON", type="primary", width="stretch"):
-            with out_path.open("w", encoding="utf-8") as fp:
-                json.dump(final, fp, ensure_ascii=False, indent=2)
-            st.session_state.final_saved = True
-            st.success(f"Saved to `{out_path.resolve()}`")
-            st.balloons()
+        col_save, col_verify = st.columns(2)
+
+        with col_save:
+            if st.button("Save to JSON", type="secondary", use_container_width=True):
+                with out_path.open("w", encoding="utf-8") as fp:
+                    json.dump(final, fp, ensure_ascii=False, indent=2)
+                st.session_state.final_saved = True
+                st.success(f"Saved to `{out_path.resolve()}`")
+
+        with col_verify:
+            if st.button("Proceed to Verification & Approval", type="primary", use_container_width=True):
+                with out_path.open("w", encoding="utf-8") as fp:
+                    json.dump(final, fp, ensure_ascii=False, indent=2)
+                st.session_state.final_saved = True
+                st.success(
+                    "Extraction saved. Open the **Verification UI** to review and approve:\n\n"
+                    "```\nstreamlit run verify_ui.py\n```"
+                )
+                st.balloons()
+
+        if st.session_state.final_saved:
+            st.divider()
+            st.markdown("### Next Steps")
+            st.markdown(
+                "1. **Verify & Approve** — run `streamlit run verify_ui.py` to review extracted fields, "
+                "make corrections, and approve the document.\n"
+                "2. **Egress API** — run `python app.py` to start the FastAPI server, then call:\n"
+                "   ```\n"
+                "   GET http://localhost:8000/egress/{document_id}\n"
+                "   ```\n"
+                "3. **List verified documents** — `GET http://localhost:8000/documents`"
+            )
 
 
 if __name__ == "__main__":
