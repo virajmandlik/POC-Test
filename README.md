@@ -13,10 +13,10 @@ Automation toolkit for **Farmers for Forests (F4F)** farmer onboarding workflows
 venv312\Scripts\activate
 
 # Run Use Case 1 - Land Record OCR
-streamlit run pipeline_ui.py
+streamlit run usecase1_land_record_ocr.py
 
 # Run Use Case 2 - CC Photo Verification
-streamlit run verify_ui.py
+streamlit run usecase2_photo_verification.py
 ```
 
 **Requirement:** Set `CXAI_API_KEY` in `.env` for Vision and Combined modes.
@@ -25,7 +25,7 @@ streamlit run verify_ui.py
 
 ## Use Case 1 - Land Record OCR & Extraction
 
-**File:** `pipeline_ui.py`
+**File:** `usecase1_land_record_ocr.py`
 
 Extracts structured data from Maharashtra 7/12 (Saat-Baara) land record documents (PDFs or images) into a standardised JSON schema.
 
@@ -61,7 +61,7 @@ Extracts structured data from Maharashtra 7/12 (Saat-Baara) land record document
 
 ## Use Case 2 - CC Training Photo Verification
 
-**File:** `verify_ui.py`
+**File:** `usecase2_photo_verification.py`
 
 Verifies photographic evidence submitted for carbon credit training sessions. Each photo must prove a training event occurred with identifiable participants, location, and timestamp.
 
@@ -103,8 +103,8 @@ Upload a JPEG/PNG and walk through 4 tabs:
 ## Project Structure
 
 ```
-pipeline_ui.py                  --> UC1: Land Record OCR (Streamlit app)
-verify_ui.py                    --> UC2: CC Photo Verification (Streamlit app)
+usecase1_land_record_ocr.py                  --> UC1: Land Record OCR (Streamlit app)
+usecase2_photo_verification.py                    --> UC2: CC Photo Verification (Streamlit app)
 paddleocr_pdf_to_json_demo.py   --> PaddleOCR subprocess worker (Python 3.12)
 .env                            --> CXAI_API_KEY (not committed)
 
