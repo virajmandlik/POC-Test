@@ -20,6 +20,7 @@ from PIL import Image
 from pydantic import BaseModel, Field
 
 from cc_verify import TrainingPhotoVerifier
+from cc_pipeline import PDFExtractor, PDFIdentifiers, PipelineFactory
 
 load_dotenv()
 
@@ -373,6 +374,45 @@ def verify_training(
     result = verifier.verify(img=img, skip_vision=skip_vision)
 
     return result.to_dict()
+
+
+@app.post("/verify-training-pdf")
+def verify_training_pdf(
+    pdf: UploadFile = File(..., description="CC training PDF (3-page report)"),
+    skip_vision: bool = Form(False, description="Skip GPT-4 Vision scene analysis"),
+):
+    """
+    Extract training photo from a CC training PDF and verify it.
+    The PDF should follow the standard 3-page format:
+    page 1 = meeting minutes, page 2 = attendees, page 3 = training photo.
+    """
+    if pdf.content_type and pdf.content_type != "application/pdf":
+        raise HTTPException(status_code=400, detail="Upload must be a PDF file")
+
+    import tempfile
+    try:
+        contents = pdf.file.read()
+        tmp = Path(tempfile.mktemp(suffix=".pdf"))
+        tmp.write_bytes(contents)
+
+        extractor = PDFExtractor()
+        img = extractor.extract_photo(tmp)
+        tmp.unlink(missing_ok=True)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Could not extract photo from PDF: {exc}")
+
+    ids = PDFIdentifiers.from_filename(pdf.filename or "unknown.pdf")
+
+    api_key = os.environ.get("CXAI_API_KEY", "")
+    verifier = TrainingPhotoVerifier(api_key=api_key)
+    result = verifier.verify(img=img, skip_vision=skip_vision)
+
+    response = result.to_dict()
+    if ids:
+        response["metadata"]["lid"] = ids.lid
+        response["metadata"]["fid"] = ids.fid
+
+    return response
 
 
 def _apply_correction(data: dict, field_path: str, new_value: str):
