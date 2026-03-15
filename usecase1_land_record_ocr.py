@@ -63,6 +63,7 @@ OUTPUT_DIR.mkdir(exist_ok=True)
 # 7/12 extract schema — GPT-4o-mini populates this exact structure
 OUTPUT_TEMPLATE = {
     "document_type": "",
+    "report_date": "",
     "state": "",
     "taluka": "",
     "district": "",
@@ -73,7 +74,7 @@ OUTPUT_TEMPLATE = {
     "sub_division": "",
     "local_name": "",
     "tenure": {"class": "", "type": ""},
-    "owner": {"name": "", "account_number": ""},
+    "owners": [],
     "area": {
         "cultivable": {
             "jirayat_hectare": "",
@@ -89,13 +90,19 @@ OUTPUT_TEMPLATE = {
         "total_area_hectare": "",
         "unit": "\u0939\u0947.\u0906\u0930.\u091a\u094c.\u092e\u0940.",
     },
-    "assessment": {"base_rupees": "", "special_rupees": ""},
+    "assessment": {"base_rupees": "", "special_rupees": "", "total_rupees": ""},
     "mutation": {
         "last_number": "",
         "last_date": "",
         "pending": "",
-        "old_numbers": [],
+        "all_numbers": [],
     },
+    "encumbrances": [],
+    "water_resources": {
+        "wells": [],
+        "irrigation": "",
+    },
+    "public_resources": "",
     "rights": {"tenant_name": "", "other_rights": ""},
     "heir_info": "",
     "boundary_marks": "",
@@ -113,8 +120,12 @@ OUTPUT_TEMPLATE = {
 
 UC1_CSV_COLUMNS = [
     "filename", "extraction_mode", "status",
-    "document_type", "state", "district", "taluka", "village",
-    "survey_number", "owner_name", "total_area_hectare",
+    "document_type", "report_date", "state", "district", "taluka", "village",
+    "survey_number", "owner_count", "primary_owner_name",
+    "total_area_hectare", "jirayat_hectare",
+    "assessment_total_rupees",
+    "encumbrance_count", "encumbrance_total_rupees",
+    "well_count", "last_mutation_number", "mutation_count",
     "fields_filled", "fields_total",
     "processing_time_s", "processed_at_utc",
 ]
@@ -473,6 +484,8 @@ def _fill_template(template: dict, source: dict) -> None:
             continue
         if isinstance(template[key], dict) and isinstance(source[key], dict):
             _fill_template(template[key], source[key])
+        elif isinstance(template[key], list) and isinstance(source[key], list):
+            template[key] = source[key]
         else:
             template[key] = source[key]
 
@@ -701,10 +714,22 @@ class ExtractionEngine:
             "1. Fill the EXACT JSON template below. Do NOT add, remove, or rename any keys.\n"
             "2. For each field, pick the most accurate/complete value from either source.\n"
             "3. If a field is not found in either source, set it to empty string \"\" or empty list [].\n"
-            "4. In 'source_comparison.fields_differing', list fields where the two sources disagree.\n"
-            "5. In 'source_comparison.paddle_only', list data found ONLY in PaddleOCR.\n"
-            "6. In 'source_comparison.vision_only', list data found ONLY in Vision.\n"
-            "7. Respond ONLY with valid JSON matching the template. No markdown fences.\n\n"
+            "4. 'report_date': extract the \u0905\u0939\u0935\u093e\u0932 \u0926\u093f\u0928\u093e\u0902\u0915 date.\n"
+            "5. 'owners': extract ALL owners/shareholders as a list. Each entry must have: "
+            "\"name\", \"account_number\" (\u0916\u093e\u0924\u0947 \u0915\u094d\u0930), \"area_hectare\" (\u0915\u094d\u0937\u0947\u0924\u094d\u0930), "
+            "\"assessment_rupees\" (\u0906\u0915\u093e\u0930), \"mutation_ref\" (ferfer number in parentheses).\n"
+            "6. 'encumbrances': extract ALL liens/mortgages (\u092c\u094b\u091c\u093e) as a list. Each entry: "
+            "\"type\" (bank_mortgage/cooperative/other), \"bank_name\", \"branch\", "
+            "\"amount_rupees\", \"borrower_name\", \"date\", \"mutation_ref\".\n"
+            "7. 'water_resources.wells': list all wells (\u0935\u093f\u0939\u0940\u0930) with \"owner\" and \"mutation_ref\".\n"
+            "8. 'water_resources.irrigation': irrigation info (\u0932\u0918\u0941\u0938\u093f\u0902\u091a\u0928 \u0924\u0932\u093e\u0935 etc.).\n"
+            "9. 'public_resources': any note about public property (\u0938\u093e\u0930\u094d\u0935\u091c\u0928\u093f\u0915 \u092e\u093e\u0932\u092e\u0924\u094d\u0924\u093e).\n"
+            "10. 'mutation.all_numbers': list ALL ferfer/mutation numbers found in the document.\n"
+            "11. 'assessment.total_rupees': total assessment amount.\n"
+            "12. In 'source_comparison.fields_differing', list fields where the two sources disagree.\n"
+            "13. In 'source_comparison.paddle_only', list data found ONLY in PaddleOCR.\n"
+            "14. In 'source_comparison.vision_only', list data found ONLY in Vision.\n"
+            "15. Respond ONLY with valid JSON matching the template. No markdown fences.\n\n"
             f"TEMPLATE:\n{template_str}"
         )
 
@@ -808,6 +833,76 @@ class ComparativeAnalyzer:
 
 
 # ═══════════════════════════════════════════════════════════════════════
+# SEMANTIC ANALYZER (ownership chain & knowledge graph via GPT-4o-mini)
+# ═══════════════════════════════════════════════════════════════════════
+
+
+class SemanticAnalyzer:
+    """Infers ownership chain, land semantics, and relationship graph from extracted data."""
+
+    SEMANTIC_SCHEMA = json.dumps({
+        "land_summary": {
+            "survey_number": "", "village": "", "taluka": "", "district": "",
+            "total_area_hectare": "", "cultivable_hectare": "", "uncultivable_hectare": "",
+            "tenure_type": "",
+        },
+        "original_owner": {"name": "", "notes": ""},
+        "ownership_chain": [{
+            "from_owner": "", "to_owner": "", "mutation_ref": "",
+            "transfer_type": "", "area_hectare": "", "year_approx": "",
+        }],
+        "current_owners": [{
+            "name": "", "account_number": "", "area_hectare": "", "assessment_rupees": "",
+        }],
+        "encumbrances_mapped": [{
+            "owner_name": "", "bank_name": "", "amount_rupees": "",
+            "type": "", "mutation_ref": "",
+        }],
+        "wells": [{"owner": "", "mutation_ref": ""}],
+        "key_dates": {
+            "report_date": "", "last_mutation_date": "", "last_mutation_number": "",
+        },
+    }, ensure_ascii=False, indent=2)
+
+    def __init__(self, api_key: str):
+        self._api_key = api_key
+
+    def analyze(self, merged_extraction: dict) -> tuple[dict, float]:
+        ext_str = json.dumps(merged_extraction, ensure_ascii=False, indent=2)
+
+        system_prompt = (
+            "You are a Maharashtra land record (7/12 extract) domain expert.\n"
+            "You receive the structured extraction of a 7/12 land record document.\n\n"
+            "Your job is to produce a SEMANTIC KNOWLEDGE GRAPH.\n\n"
+            "RULES:\n"
+            "1. Identify the ORIGINAL owner (earliest known, मूळ मालक) based on mutation\n"
+            "   references. Lower mutation numbers typically indicate older records.\n"
+            "2. Build the OWNERSHIP CHAIN — trace how land transferred from the original\n"
+            "   owner through mutations to current owners. Each transfer: from_owner,\n"
+            "   to_owner, mutation_ref, transfer_type (inheritance/sale/partition/gift/other),\n"
+            "   area if known, approximate year if inferable.\n"
+            "3. List all CURRENT OWNERS with account numbers, areas, and assessments.\n"
+            "4. Map each ENCUMBRANCE (loan/mortgage/boja) to the specific owner it applies to.\n"
+            "5. Provide LAND SUMMARY with total area, cultivable/uncultivable breakdown.\n"
+            "6. List wells with their owners.\n"
+            "7. Extract key dates (report date, last mutation date/number).\n"
+            "8. Respond ONLY with valid JSON. No markdown fences.\n\n"
+            f"TEMPLATE:\n{self.SEMANTIC_SCHEMA}"
+        )
+
+        user_prompt = (
+            f"=== Extracted Land Record Data ===\n{ext_str}\n\n"
+            "Analyze this data and produce the semantic knowledge graph."
+        )
+
+        t0 = time.perf_counter()
+        resp = _call_gpt4o_mini(self._api_key, system_prompt, user_prompt)
+        elapsed = time.perf_counter() - t0
+
+        return _parse_llm_json(resp), elapsed
+
+
+# ═══════════════════════════════════════════════════════════════════════
 # BATCH PROCESSING (Queue system for UC1)
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -879,17 +974,60 @@ class UC1CSVResultStore:
 
         merged = job.result.get("merged_extraction", {})
         row["document_type"] = merged.get("document_type", "")
+        row["report_date"] = merged.get("report_date", "")
         row["state"] = merged.get("state", "")
         row["district"] = merged.get("district", "")
         row["taluka"] = merged.get("taluka", "")
         row["village"] = merged.get("village", "")
         row["survey_number"] = merged.get("survey_number", "")
 
-        owner = merged.get("owner", {})
-        row["owner_name"] = owner.get("name", "") if isinstance(owner, dict) else ""
+        owners = merged.get("owners", [])
+        if isinstance(owners, list):
+            row["owner_count"] = len(owners)
+            row["primary_owner_name"] = owners[0].get("name", "") if owners else ""
+        else:
+            row["owner_count"] = 0
+            row["primary_owner_name"] = ""
 
         area = merged.get("area", {})
-        row["total_area_hectare"] = area.get("total_area_hectare", "") if isinstance(area, dict) else ""
+        if isinstance(area, dict):
+            row["total_area_hectare"] = area.get("total_area_hectare", "")
+            cultivable = area.get("cultivable", {})
+            row["jirayat_hectare"] = cultivable.get("jirayat_hectare", "") if isinstance(cultivable, dict) else ""
+        else:
+            row["total_area_hectare"] = ""
+            row["jirayat_hectare"] = ""
+
+        assessment = merged.get("assessment", {})
+        row["assessment_total_rupees"] = assessment.get("total_rupees", "") if isinstance(assessment, dict) else ""
+
+        encumbrances = merged.get("encumbrances", [])
+        if isinstance(encumbrances, list):
+            row["encumbrance_count"] = len(encumbrances)
+            total_enc = 0
+            for enc in encumbrances:
+                amt = enc.get("amount_rupees", "") if isinstance(enc, dict) else ""
+                try:
+                    total_enc += int(str(amt).replace(",", "").replace("/-", "").strip())
+                except (ValueError, TypeError):
+                    pass
+            row["encumbrance_total_rupees"] = total_enc if total_enc else ""
+        else:
+            row["encumbrance_count"] = 0
+            row["encumbrance_total_rupees"] = ""
+
+        water = merged.get("water_resources", {})
+        wells = water.get("wells", []) if isinstance(water, dict) else []
+        row["well_count"] = len(wells) if isinstance(wells, list) else 0
+
+        mutation = merged.get("mutation", {})
+        if isinstance(mutation, dict):
+            row["last_mutation_number"] = mutation.get("last_number", "")
+            all_nums = mutation.get("all_numbers", [])
+            row["mutation_count"] = len(all_nums) if isinstance(all_nums, list) else 0
+        else:
+            row["last_mutation_number"] = ""
+            row["mutation_count"] = 0
 
         filled, empty = _count_fields(merged)
         row["fields_filled"] = filled
@@ -964,6 +1102,226 @@ class UC1BatchProcessor:
 # ═══════════════════════════════════════════════════════════════════════
 
 
+def _build_ownership_dot(semantic: dict) -> str:
+    """Build a Graphviz DOT string for the ownership knowledge graph."""
+    summary = semantic.get("land_summary", {})
+    original = semantic.get("original_owner", {})
+    chain = semantic.get("ownership_chain", [])
+    current = semantic.get("current_owners", [])
+    encumbrances = semantic.get("encumbrances_mapped", [])
+    wells = semantic.get("wells", [])
+
+    survey = summary.get("survey_number", "?")
+    village = summary.get("village", "")
+    total_area = summary.get("total_area_hectare", "?")
+
+    def esc(s: str) -> str:
+        return s.replace('"', '\\"').replace("\n", " ")
+
+    lines = [
+        "digraph ownership {",
+        "  rankdir=TB;",
+        '  graph [fontname="Arial", label="", labelloc=t, fontsize=14];',
+        '  node [shape=box, style="rounded,filled", fontname="Arial", fontsize=11];',
+        '  edge [fontname="Arial", fontsize=9];',
+        "",
+        f'  land [label="{esc(village)}\\nSurvey: {esc(survey)} | {esc(total_area)} ha",'
+        '  shape=ellipse, fillcolor="#C8E6C9", penwidth=2];',
+        "",
+    ]
+
+    node_ids: dict[str, str] = {}
+    counter = [0]
+
+    def nid(name: str) -> str:
+        if name not in node_ids:
+            node_ids[name] = f"n{counter[0]}"
+            counter[0] += 1
+        return node_ids[name]
+
+    declared: set[str] = set()
+
+    def declare(name: str, extra_label: str = "", color: str = "#BBDEFB", bold: bool = False):
+        n = nid(name)
+        if n in declared:
+            return
+        declared.add(n)
+        label = esc(name)
+        if extra_label:
+            label += f"\\n{esc(extra_label)}"
+        style = '"rounded,filled,bold"' if bold else '"rounded,filled"'
+        lines.append(f'  {n} [label="{label}", fillcolor="{color}", style={style}];')
+
+    if original.get("name"):
+        declare(original["name"], "(Original Owner)", "#FFF9C4")
+
+    current_names = {o.get("name", "") for o in current if o.get("name")}
+
+    for transfer in chain:
+        fr = transfer.get("from_owner", "")
+        to = transfer.get("to_owner", "")
+        if not fr or not to:
+            continue
+        declare(fr, color="#FFF9C4")
+        is_current = to in current_names
+        declare(to, color="#C8E6C9" if is_current else "#BBDEFB", bold=is_current)
+
+        parts = []
+        if transfer.get("transfer_type"):
+            parts.append(transfer["transfer_type"])
+        if transfer.get("mutation_ref"):
+            parts.append(f"Mut#{transfer['mutation_ref']}")
+        if transfer.get("area_hectare"):
+            parts.append(f"{transfer['area_hectare']} ha")
+        edge_label = esc("\\n".join(parts))
+        lines.append(f'  {nid(fr)} -> {nid(to)} [label="{edge_label}", color="#1565C0"];')
+
+    for owner in current:
+        name = owner.get("name", "")
+        if not name:
+            continue
+        acct = owner.get("account_number", "")
+        area = owner.get("area_hectare", "")
+        extra = []
+        if acct:
+            extra.append(f"Acct#{acct}")
+        if area:
+            extra.append(f"{area} ha")
+        declare(name, " | ".join(extra), "#C8E6C9", bold=True)
+        lines.append(
+            f'  {nid(name)} -> land [style=dashed, color="#388E3C",'
+            f' label="owns", arrowhead=none];'
+        )
+
+    for i, enc in enumerate(encumbrances):
+        bank = enc.get("bank_name", f"Institution {i + 1}")
+        amount = enc.get("amount_rupees", "")
+        bank_label = esc(bank)
+        if amount:
+            bank_label += f"\\n₹{esc(str(amount))}"
+        bid = f"bank_{i}"
+        lines.append(
+            f'  {bid} [label="{bank_label}", shape=hexagon,'
+            f' fillcolor="#FFCDD2", style=filled];'
+        )
+        owner_name = enc.get("owner_name", "")
+        if owner_name in node_ids:
+            mut = enc.get("mutation_ref", "")
+            elabel = esc(enc.get("type", "encumbrance"))
+            if mut:
+                elabel += f"\\nMut#{esc(mut)}"
+            lines.append(
+                f'  {node_ids[owner_name]} -> {bid}'
+                f' [style=dotted, color="#D32F2F", label="{elabel}"];'
+            )
+
+    for i, well in enumerate(wells):
+        wowner = well.get("owner", "")
+        if not wowner:
+            continue
+        wid = f"well_{i}"
+        wlabel = "Well"
+        if well.get("mutation_ref"):
+            wlabel += f"\\nMut#{esc(well['mutation_ref'])}"
+        lines.append(
+            f'  {wid} [label="{wlabel}", shape=diamond,'
+            f' fillcolor="#B3E5FC", style=filled];'
+        )
+        if wowner in node_ids:
+            lines.append(
+                f'  {node_ids[wowner]} -> {wid}'
+                f' [style=dashed, color="#0288D1", label="well owner"];'
+            )
+
+    lines.append("}")
+    return "\n".join(lines)
+
+
+def _render_semantic_view(semantic: dict):
+    """Render the full semantic knowledge graph visualization."""
+    if "raw_llm_response" in semantic:
+        st.warning("Semantic analysis returned non-JSON.")
+        st.code(semantic["raw_llm_response"])
+        return
+
+    summary = semantic.get("land_summary", {})
+    st.markdown("### Land Summary")
+    cols = st.columns(4)
+    cols[0].metric("Survey No.", summary.get("survey_number", "—"))
+    cols[1].metric("Village", summary.get("village", "—"))
+    cols[2].metric("Taluka", summary.get("taluka", "—"))
+    cols[3].metric("District", summary.get("district", "—"))
+
+    cols2 = st.columns(4)
+    cols2[0].metric("Total Area", f"{summary.get('total_area_hectare', '—')} ha")
+    cols2[1].metric("Cultivable", f"{summary.get('cultivable_hectare', '—')} ha")
+    cols2[2].metric("Uncultivable", f"{summary.get('uncultivable_hectare', '—')} ha")
+    cols2[3].metric("Tenure", summary.get("tenure_type", "—"))
+
+    st.divider()
+
+    orig = semantic.get("original_owner", {})
+    if orig.get("name"):
+        st.markdown("### Original Owner")
+        st.info(f"**{orig['name']}** — {orig.get('notes', '')}")
+
+    chain = semantic.get("ownership_chain", [])
+    current = semantic.get("current_owners", [])
+
+    if chain or current:
+        st.markdown("### Ownership & Encumbrance Graph")
+        dot = _build_ownership_dot(semantic)
+        st.graphviz_chart(dot, use_container_width=True)
+
+    if current:
+        st.markdown("### Current Owners")
+        owner_rows = [
+            {
+                "Name": o.get("name", ""),
+                "Account No.": o.get("account_number", ""),
+                "Area (ha)": o.get("area_hectare", ""),
+                "Assessment (Rs)": o.get("assessment_rupees", ""),
+            }
+            for o in current
+        ]
+        st.dataframe(pd.DataFrame(owner_rows), use_container_width=True, hide_index=True)
+
+    enc = semantic.get("encumbrances_mapped", [])
+    if enc:
+        st.markdown("### Encumbrances (Loans & Mortgages)")
+        enc_rows = [
+            {
+                "Owner": e.get("owner_name", ""),
+                "Bank / Institution": e.get("bank_name", ""),
+                "Amount (Rs)": e.get("amount_rupees", ""),
+                "Type": e.get("type", ""),
+                "Mutation Ref": e.get("mutation_ref", ""),
+            }
+            for e in enc
+        ]
+        st.dataframe(pd.DataFrame(enc_rows), use_container_width=True, hide_index=True)
+
+    wells = semantic.get("wells", [])
+    if wells:
+        st.markdown("### Water Resources")
+        for w in wells:
+            st.markdown(
+                f"- Well owned by **{w.get('owner', '—')}** "
+                f"(Mutation: {w.get('mutation_ref', '—')})"
+            )
+
+    dates = semantic.get("key_dates", {})
+    if any(dates.values()):
+        st.markdown("### Key Dates")
+        dc = st.columns(3)
+        dc[0].metric("Report Date", dates.get("report_date", "—"))
+        dc[1].metric("Last Mutation No.", dates.get("last_mutation_number", "—"))
+        dc[2].metric("Last Mutation Date", dates.get("last_mutation_date", "—"))
+
+    with st.expander("View Full Semantic JSON"):
+        st.json(semantic)
+
+
 def _render_quality(qc: QualityReport):
     st.metric("Resolution", f"{qc.width}x{qc.height} ({qc.megapixels} MP)")
     st.metric("Sharpness", f"{qc.sharpness} ({qc.blur_score})")
@@ -985,16 +1343,17 @@ def _single_mode(api_key: str):
         ("step", 1), ("approved", False), ("prep_path", None),
         ("preprocessing_skipped", False), ("force_preprocess", False),
         ("raw_result", None), ("prep_result", None),
-        ("comparison", None), ("final_saved", False),
+        ("comparison", None), ("semantic_result", None), ("final_saved", False),
     ]:
         if key not in st.session_state:
             st.session_state[key] = default
 
-    tab1, tab2, tab3, tab4 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5 = st.tabs([
         "1. Upload & Preprocess",
         "2. Run Pipelines",
         "3. Comparative Analysis",
-        "4. Final Output",
+        "4. Semantic & Knowledge Graph",
+        "5. Final Output",
     ])
 
     # ── Tab 1: Upload & Preprocess ───────────────────────────────
@@ -1192,7 +1551,7 @@ def _single_mode(api_key: str):
                 "note": "Preprocessing skipped — raw quality gate passed",
             }
             st.session_state.step = 4
-            st.success("Go to **Final Output** tab to save results.")
+            st.success("Go to **Semantic & Knowledge Graph** tab.")
         else:
             col1, col2 = st.columns(2)
             with col1:
@@ -1236,16 +1595,48 @@ def _single_mode(api_key: str):
                         st.markdown("**Field-by-field comparison:**")
                         st.json(field_comp)
 
-                    st.success("Go to **Final Output** tab to save results.")
+                    st.success("Go to **Semantic & Knowledge Graph** tab.")
                 else:
                     st.warning("LLM returned non-JSON. Raw response:")
                     st.code(comp.get("raw_llm_response", ""))
 
-    # ── Tab 4: Final Output ──────────────────────────────────────
+    # ── Tab 4: Semantic & Knowledge Graph ─────────────────────────
     with tab4:
+        st.subheader("Semantic & Knowledge Graph")
+        raw_result = st.session_state.raw_result
+        if not raw_result:
+            st.warning("Complete Step 2 first — run the pipeline(s).")
+            return
+
+        best_extraction = raw_result.get("merged_extraction", {})
+        prep_result = st.session_state.prep_result
+        if prep_result and prep_result.get("status") == "ok":
+            best_extraction = prep_result.get("merged_extraction", best_extraction)
+
+        st.markdown(
+            "Analyze the extracted data to build an **ownership chain**, "
+            "identify **current vs original owners**, and visualize "
+            "**encumbrances and land relationships** as a graph."
+        )
+
+        if st.button("Run Semantic Analysis", type="primary", use_container_width=True):
+            sem_analyzer = SemanticAnalyzer(api_key)
+            with st.spinner("Building semantic knowledge graph with GPT-4o-mini..."):
+                sem_result, sem_elapsed = sem_analyzer.analyze(best_extraction)
+            st.session_state.semantic_result = sem_result
+            st.success(f"Semantic analysis complete ({sem_elapsed:.1f}s). "
+                       "Go to **Final Output** tab to save.")
+            st.session_state.step = 5
+
+        if st.session_state.semantic_result:
+            st.divider()
+            _render_semantic_view(st.session_state.semantic_result)
+
+    # ── Tab 5: Final Output ──────────────────────────────────────
+    with tab5:
         st.subheader("Final Output")
-        if not st.session_state.comparison:
-            st.warning("Complete Step 3 first.")
+        if not st.session_state.raw_result:
+            st.warning("Complete earlier steps first.")
             return
 
         skipped_fin = st.session_state.preprocessing_skipped
@@ -1257,7 +1648,10 @@ def _single_mode(api_key: str):
         }
         if not skipped_fin and st.session_state.prep_result:
             final["preprocessed_extraction"] = st.session_state.prep_result.get("merged_extraction", {})
+        if st.session_state.comparison:
             final["comparative_analysis"] = st.session_state.comparison
+        if st.session_state.semantic_result:
+            final["semantic_knowledge_graph"] = st.session_state.semantic_result
 
         st.json(final)
 
@@ -1396,7 +1790,8 @@ def _run_batch_uc1(sources: list[tuple[str, "Path | bytes"]], api_key: str, mode
         display_cols = [
             "filename", "extraction_mode", "status",
             "district", "taluka", "village", "survey_number",
-            "owner_name", "total_area_hectare", "fields_filled",
+            "owner_count", "primary_owner_name",
+            "total_area_hectare", "encumbrance_count", "well_count",
         ]
         available = [c for c in display_cols if c in df.columns]
         table_placeholder.dataframe(
@@ -1443,17 +1838,44 @@ def _render_batch_results_uc1():
     st.divider()
     st.subheader("Inspect Individual Results")
 
+    api_key = os.environ.get("CXAI_API_KEY", "")
     jobs = st.session_state.batch_jobs
     if jobs:
-        for job in jobs:
+        for idx, job in enumerate(jobs):
             icon = "+" if job.status == "ok" else "-"
             with st.expander(f"[{icon}] {job.filename} -- {job.status} ({job.processing_time_s:.1f}s)"):
                 if job.result:
                     merged = job.result.get("merged_extraction", {})
-                    st.json(merged)
-                    timing = job.result.get("timing_seconds", {})
-                    if timing:
-                        st.caption(f"Timing: {json.dumps(timing)}")
+
+                    view_tab, graph_tab = st.tabs(["Extracted JSON", "Semantic Graph"])
+                    with view_tab:
+                        st.json(merged)
+                        timing = job.result.get("timing_seconds", {})
+                        if timing:
+                            st.caption(f"Timing: {json.dumps(timing)}")
+
+                    with graph_tab:
+                        sem_key = f"batch_semantic_{idx}"
+                        if sem_key not in st.session_state:
+                            st.session_state[sem_key] = None
+
+                        if st.button(
+                            "Run Semantic Analysis",
+                            key=f"sem_btn_{idx}",
+                            use_container_width=True,
+                        ):
+                            if api_key:
+                                sem = SemanticAnalyzer(api_key)
+                                with st.spinner("Building knowledge graph..."):
+                                    result, elapsed = sem.analyze(merged)
+                                st.session_state[sem_key] = result
+                                st.success(f"Done ({elapsed:.1f}s)")
+                            else:
+                                st.error("CXAI_API_KEY required for semantic analysis.")
+
+                        if st.session_state[sem_key]:
+                            _render_semantic_view(st.session_state[sem_key])
+
                 if job.error:
                     st.error(job.error)
 
