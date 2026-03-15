@@ -1,17 +1,27 @@
 """
 DocExtract — FastAPI Application
-Serves /egress, /status, /verify endpoints for verified document data.
+Serves /egress, /status, /verify endpoints for verified document data,
+and /verify-training for carbon credit training photo verification.
 """
 
+import io
 import json
+import os
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
+from PIL import Image
 from pydantic import BaseModel, Field
+
+from cc_verify import TrainingPhotoVerifier
+
+load_dotenv()
 
 BASE_DIR = Path(__file__).parent
 OUTPUT_DIR = BASE_DIR / "output"
@@ -23,8 +33,11 @@ VERIFIED_DIR.mkdir(parents=True, exist_ok=True)
 
 app = FastAPI(
     title="DocExtract Pipeline API",
-    description="Egress API for verified Maharashtra 7/12 land record extractions",
-    version="1.0.0",
+    description=(
+        "Egress API for verified Maharashtra 7/12 land record extractions "
+        "and carbon credit training photo verification"
+    ),
+    version="1.1.0",
 )
 
 app.add_middleware(
@@ -98,6 +111,21 @@ class IngressResponse(BaseModel):
     egress_url: str
 
 
+# ── Training Photo Verification Models ────────────────────────────
+
+
+class TrainingCheckDetail(BaseModel):
+    passed: bool
+    model_config = {"extra": "allow"}
+
+
+class TrainingVerifyResponse(BaseModel):
+    decision: str
+    checks: dict[str, TrainingCheckDetail]
+    rejection_reasons: list[str]
+    metadata: dict[str, Any]
+
+
 # ── Helpers ──────────────────────────────────────────────────────
 
 
@@ -137,6 +165,7 @@ def root():
             "status": "GET /status/{document_id}",
             "verify": "POST /verify/{document_id}",
             "list": "GET /documents",
+            "verify_training": "POST /verify-training",
         },
     }
 
@@ -318,6 +347,32 @@ def verify(document_id: str, body: VerifyRequest):
             corrections_saved=0,
             training_data_logged=False,
         )
+
+
+@app.post("/verify-training", response_model=TrainingVerifyResponse)
+def verify_training(
+    photo: UploadFile = File(..., description="JPEG/PNG training session photo"),
+    skip_vision: bool = Form(False, description="Skip GPT-4 Vision scene analysis"),
+):
+    """
+    Verify a carbon credit training session photo.
+    Returns ACCEPT/REJECT with detailed check results.
+    """
+    if photo.content_type and not photo.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="Upload must be an image file (JPEG/PNG)")
+
+    try:
+        contents = photo.file.read()
+        img = Image.open(io.BytesIO(contents)).convert("RGB")
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Could not read image: {exc}")
+
+    api_key = os.environ.get("CXAI_API_KEY", "")
+    verifier = TrainingPhotoVerifier(api_key=api_key)
+
+    result = verifier.verify(img=img, skip_vision=skip_vision)
+
+    return result.to_dict()
 
 
 def _apply_correction(data: dict, field_path: str, new_value: str):
