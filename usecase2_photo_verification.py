@@ -41,6 +41,17 @@ from PIL import Image
 
 load_dotenv()
 
+# ── Job system + audit integration ────────────────────────────────
+try:
+    from lib.config import cfg
+    from lib.audit import audit_log
+    from lib.job_types import register_all_job_types
+    from lib.jobs import job_manager
+    register_all_job_types()
+    _HAS_JOB_SYSTEM = True
+except Exception:
+    _HAS_JOB_SYSTEM = False
+
 log = logging.getLogger("cc_verify")
 
 VISION_API_URL = "https://cxai-playground.cisco.com/chat/completions"
@@ -1015,6 +1026,63 @@ def _batch_pdf_mode(api_key: str):
 # ═══════════════════════════════════════════════════════════════════════
 
 
+# ═══════════════════════════════════════════════════════════════════════
+# BACKGROUND JOB SUBMISSION (optional — only when job system is available)
+# ═══════════════════════════════════════════════════════════════════════
+
+
+def _render_job_sidebar():
+    """Show background job submission in sidebar when job system is available."""
+    if not _HAS_JOB_SYSTEM:
+        return
+
+    with st.sidebar:
+        st.markdown("### Background Jobs")
+        st.caption("Submit verification as a tracked background job")
+
+        job_user = st.text_input(
+            "Your name (for audit)",
+            value=os.environ.get("USER", os.environ.get("USERNAME", "user")),
+            key="sidebar_job_user_uc2",
+        )
+        job_file = st.text_input(
+            "Image path (in uploads/)",
+            placeholder="uploads/photo.jpg",
+            key="sidebar_job_file_uc2",
+        )
+
+        if st.button("Submit as Background Job", key="sidebar_submit_job_uc2"):
+            if not job_file:
+                st.warning("Enter a file path.")
+            else:
+                try:
+                    job_id = job_manager.submit(
+                        job_type="uc2.verify",
+                        params={"image_path": job_file, "skip_vision": False},
+                        user=job_user,
+                    )
+                    st.success(f"Job submitted: `{job_id}`")
+                except Exception as exc:
+                    st.error(f"Failed: {exc}")
+
+        # Show recent jobs
+        st.divider()
+        st.markdown("### Recent Jobs")
+        try:
+            recent = job_manager.list_jobs(job_type="uc2.verify", limit=5)
+            for j in recent:
+                status_icon = {
+                    "completed": "+", "failed": "-", "running": "~",
+                    "pending": ".", "cancelled": "x",
+                }.get(j["status"], "?")
+                st.markdown(
+                    f"`[{status_icon}]` **{j['status']}** {j['progress']}% "
+                    f"— {j.get('progress_message', '')[:40]}"
+                )
+        except Exception:
+            st.caption("Could not load recent jobs.")
+
+
 def main():
     st.set_page_config(
         page_title="CC Training Photo Verification",
@@ -1035,6 +1103,9 @@ def main():
         st.error("**CXAI_API_KEY** not found in `.env`. GPT Vision analysis requires this key.")
         return
 
+    # Render background job sidebar
+    _render_job_sidebar()
+
     mode = st.radio(
         "Verification Mode",
         ["Single Photo", "Batch PDFs"],
@@ -1043,6 +1114,9 @@ def main():
     )
 
     st.divider()
+
+    if _HAS_JOB_SYSTEM:
+        audit_log("uc2.page_loaded", user=os.environ.get("USER", "unknown"))
 
     if mode == "Single Photo":
         _single_photo_mode(api_key)

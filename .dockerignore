@@ -1,0 +1,42 @@
+# Virtual environments
+venv/
+venv312/
+.venv/
+
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# Generated outputs (rebuilt at runtime)
+output/
+uploads/
+
+# Environment & secrets (injected via docker-compose env_file)
+.env
+
+# IDE / OS
+.DS_Store
+.idea/
+.vscode/
+.cursor/
+*.code-workspace
+Thumbs.db
+
+# Process management
+.pids/
+logs/
+*.log
+
+# Git
+.git/
+.gitignore
+
+# Docker (prevent recursive COPY)
+Dockerfile
+docker-compose.yml
+.dockerignore
+
+# Documentation images (large, not needed at runtime)
+docs/*.png
