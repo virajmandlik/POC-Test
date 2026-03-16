@@ -1,14 +1,14 @@
 <#
 .SYNOPSIS
-    F4F POC — Setup, start, and stop apps (Windows PowerShell)
+    F4F POC -- Setup, start, and stop apps (Windows PowerShell)
 
 .DESCRIPTION
     Usage:
-        .\dev.ps1 setup     — Create venv and install dependencies
-        .\dev.ps1 start     — Start all Streamlit apps (UC1 + UC2 + Admin)
-        .\dev.ps1 stop      — Stop all running Streamlit processes
-        .\dev.ps1 status    — Check what's running
-        .\dev.ps1 restart   — Stop then start
+        .\dev.ps1 setup     -- Create venv and install dependencies
+        .\dev.ps1 start     -- Start all Streamlit apps (UC1 + UC2 + Admin)
+        .\dev.ps1 stop      -- Stop all running Streamlit processes
+        .\dev.ps1 status    -- Check what's running
+        .\dev.ps1 restart   -- Stop then start
 #>
 
 param(
@@ -21,7 +21,7 @@ $ErrorActionPreference = "Stop"
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $ScriptDir
 
-$VenvDir = Join-Path $ScriptDir ".venv"
+$VenvDir = Join-Path $ScriptDir "venv"
 $PidDir = Join-Path $ScriptDir ".pids"
 $LogDir = Join-Path $ScriptDir "logs"
 
@@ -32,7 +32,7 @@ $PortAdmin = 8502
 
 # ── Find Python ──────────────────────────────────────────────────
 function Find-Python {
-    # Check for Python 3.10+ — prefer py launcher, then python3, then python
+    # Check for Python 3.10+ -- prefer py launcher, then python3, then python
     $candidates = @("py -3.12", "py -3.11", "py -3", "python3", "python")
     foreach ($cmd in $candidates) {
         try {
@@ -52,7 +52,7 @@ function Find-Python {
 
 # ── Setup ────────────────────────────────────────────────────────
 function Invoke-Setup {
-    Write-Host "=== F4F POC — Setup ===" -ForegroundColor Cyan
+    Write-Host "=== F4F POC -- Setup ===" -ForegroundColor Cyan
 
     $python = Find-Python
     if (-not $python) {
@@ -110,7 +110,7 @@ JOB_WORKER_THREADS=2
 
 # ── Start ────────────────────────────────────────────────────────
 function Invoke-Start {
-    Write-Host "=== F4F POC — Starting apps ===" -ForegroundColor Cyan
+    Write-Host "=== F4F POC -- Starting apps ===" -ForegroundColor Cyan
 
     New-Item -ItemType Directory -Force -Path $PidDir | Out-Null
     New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
@@ -137,6 +137,15 @@ function Invoke-Start {
     Write-Host "  UC1 (Land Record OCR):     http://localhost:$PortUC1"
     Write-Host "  Admin Dashboard:           http://localhost:$PortAdmin"
     Write-Host "  UC2 (Photo Verification):  http://localhost:$PortUC2"
+    Write-Host ""
+    Write-Host "Integrations:" -ForegroundColor Cyan
+    Write-Host "  WhatsApp Bot webhook:      http://localhost:$PortAPI/api/whatsapp/webhook"
+    Write-Host "  MCP Server:                python mcp_server.py (auto-discovered by Cursor)"
+    Write-Host ""
+    Write-Host "WhatsApp setup:" -ForegroundColor Yellow
+    Write-Host "  1. Set TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN in .env"
+    Write-Host "  2. Run: ngrok http $PortAPI"
+    Write-Host "  3. Set Twilio Sandbox webhook to: https://<ngrok-url>/api/whatsapp/webhook"
     Write-Host ""
     Write-Host "Stop with: .\dev.ps1 stop"
 }
@@ -203,19 +212,19 @@ function Start-App {
 
 # ── Stop ─────────────────────────────────────────────────────────
 function Invoke-Stop {
-    Write-Host "=== F4F POC — Stopping apps ===" -ForegroundColor Cyan
+    Write-Host "=== F4F POC -- Stopping apps ===" -ForegroundColor Cyan
 
     New-Item -ItemType Directory -Force -Path $PidDir | Out-Null
     $stopped = 0
 
     foreach ($pidFile in Get-ChildItem -Path $PidDir -Filter "*.pid" -ErrorAction SilentlyContinue) {
         $name = $pidFile.BaseName
-        $pid = Get-Content $pidFile.FullName
+        $procId = Get-Content $pidFile.FullName
 
         try {
-            $proc = Get-Process -Id $pid -ErrorAction Stop
-            Write-Host "  Stopping $name (PID $pid)..."
-            Stop-Process -Id $pid -Force
+            $proc = Get-Process -Id $procId -ErrorAction Stop
+            Write-Host "  Stopping $name (PID $procId)..."
+            Stop-Process -Id $procId -Force
             $stopped++
         } catch {
             Write-Host "  $name was not running"
@@ -232,15 +241,15 @@ function Invoke-Stop {
 
 # ── Status ───────────────────────────────────────────────────────
 function Invoke-Status {
-    Write-Host "=== F4F POC — Status ===" -ForegroundColor Cyan
+    Write-Host "=== F4F POC -- Status ===" -ForegroundColor Cyan
 
     foreach ($name in @("api", "uc1", "uc2", "admin")) {
         $pidFile = Join-Path $PidDir "$name.pid"
         if (Test-Path $pidFile) {
-            $pid = Get-Content $pidFile
+            $procId = Get-Content $pidFile
             try {
-                Get-Process -Id $pid -ErrorAction Stop | Out-Null
-                Write-Host "  ${name}: RUNNING (PID $pid)" -ForegroundColor Green
+                Get-Process -Id $procId -ErrorAction Stop | Out-Null
+                Write-Host "  ${name}: RUNNING (PID $procId)" -ForegroundColor Green
             } catch {
                 Write-Host "  ${name}: STOPPED" -ForegroundColor Yellow
             }
@@ -269,10 +278,10 @@ switch ($Command) {
         Write-Host "Usage: .\dev.ps1 {setup|start|stop|status|restart}" -ForegroundColor Cyan
         Write-Host ""
         Write-Host "Commands:"
-        Write-Host "  setup    — Create venv, install deps, check MongoDB"
-        Write-Host "  start    — Start UC1 + UC2 + Admin as background processes"
-        Write-Host "  stop     — Stop all running apps"
-        Write-Host "  status   — Check what's running"
-        Write-Host "  restart  — Stop then start"
+        Write-Host "  setup    -- Create venv, install deps, check MongoDB"
+        Write-Host "  start    -- Start UC1 + UC2 + Admin as background processes"
+        Write-Host "  stop     -- Stop all running apps"
+        Write-Host "  status   -- Check what's running"
+        Write-Host "  restart  -- Stop then start"
     }
 }

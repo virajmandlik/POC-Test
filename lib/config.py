@@ -38,6 +38,17 @@ class Config:
         default_factory=lambda: os.environ.get("CXAI_API_KEY", "")
     )
 
+    # ── Twilio WhatsApp Sandbox ──────────────────────────────────
+    TWILIO_ACCOUNT_SID: str = field(
+        default_factory=lambda: os.environ.get("TWILIO_ACCOUNT_SID", "")
+    )
+    TWILIO_AUTH_TOKEN: str = field(
+        default_factory=lambda: os.environ.get("TWILIO_AUTH_TOKEN", "")
+    )
+    TWILIO_WHATSAPP_FROM: str = field(
+        default_factory=lambda: os.environ.get("TWILIO_WHATSAPP_FROM", "whatsapp:+14155238886")
+    )
+
     # ── PaddleOCR subprocess ─────────────────────────────────────
     # Resolved at runtime per OS so the same config works on Win/Mac/Linux
     PADDLE_SCRIPT: Path = field(

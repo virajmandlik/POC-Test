@@ -89,13 +89,14 @@ app.add_middleware(
 # ═══════════════════════════════════════════════════════════════════════
 
 
-from api.routers import upload, jobs, uc1, uc2, audit  # noqa: E402
+from api.routers import upload, jobs, uc1, uc2, audit, whatsapp  # noqa: E402
 
 app.include_router(upload.router)
 app.include_router(jobs.router)
 app.include_router(uc1.router)
 app.include_router(uc2.router)
 app.include_router(audit.router)
+app.include_router(whatsapp.router)
 
 
 # ═══════════════════════════════════════════════════════════════════════
