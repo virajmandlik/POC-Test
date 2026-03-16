@@ -1,0 +1,33 @@
+# F4F POC — Python dependencies
+# Install: pip install -r requirements.txt
+
+# ── UI ───────────────────────────────────────────────────────────
+streamlit>=1.30.0
+
+# ── Image processing ─────────────────────────────────────────────
+opencv-python-headless>=4.8.0
+numpy>=1.24.0
+Pillow>=10.0.0
+
+# ── PDF ──────────────────────────────────────────────────────────
+pypdfium2>=4.20.0
+
+# ── Data ─────────────────────────────────────────────────────────
+pandas>=2.0.0
+
+# ── HTTP / API ───────────────────────────────────────────────────
+requests>=2.31.0
+
+# ── FastAPI backend ──────────────────────────────────────────────
+fastapi>=0.110.0
+uvicorn[standard]>=0.27.0
+python-multipart>=0.0.6
+
+# ── Config ───────────────────────────────────────────────────────
+python-dotenv>=1.0.0
+
+# ── MongoDB (job system + audit) ─────────────────────────────────
+pymongo>=4.6.0
+
+# NOTE: paddleocr + paddlepaddle are installed in the separate venv312
+# environment, not here. See README for PaddleOCR setup.

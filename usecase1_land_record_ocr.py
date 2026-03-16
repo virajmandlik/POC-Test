@@ -48,10 +48,27 @@ from PIL import Image
 
 load_dotenv()
 
+# ── Job system + audit integration ────────────────────────────────
+try:
+    from lib.config import cfg
+    from lib.audit import audit_log
+    from lib.job_types import register_all_job_types
+    from lib.jobs import job_manager
+    register_all_job_types()
+    _HAS_JOB_SYSTEM = True
+except Exception:
+    _HAS_JOB_SYSTEM = False
+
 log = logging.getLogger("pipeline_ui")
 
 BASE_DIR = Path(__file__).parent
-PYTHON_312 = str(BASE_DIR / "venv312" / "Scripts" / "python.exe")
+# Cross-platform: use config if available, else detect OS
+if _HAS_JOB_SYSTEM:
+    PYTHON_312 = cfg.python_paddle
+else:
+    import platform as _plat
+    _venv = BASE_DIR / "venv312"
+    PYTHON_312 = str(_venv / "Scripts" / "python.exe") if _plat.system() == "Windows" else str(_venv / "bin" / "python3")
 PADDLE_SCRIPT = str(BASE_DIR / "paddleocr_pdf_to_json_demo.py")
 UPLOAD_DIR = BASE_DIR / "uploads"
 OUTPUT_DIR = BASE_DIR / "output"
@@ -1885,6 +1902,68 @@ def _render_batch_results_uc1():
 # ═══════════════════════════════════════════════════════════════════════
 
 
+# ═══════════════════════════════════════════════════════════════════════
+# BACKGROUND JOB SUBMISSION (optional — only when job system is available)
+# ═══════════════════════════════════════════════════════════════════════
+
+
+def _render_job_sidebar():
+    """Show background job submission in sidebar when job system is available."""
+    if not _HAS_JOB_SYSTEM:
+        return
+
+    with st.sidebar:
+        st.markdown("### Background Jobs")
+        st.caption("Submit extraction as a tracked background job")
+
+        job_mode = st.selectbox(
+            "Extraction mode",
+            ["combined", "paddle", "vision"],
+            key="sidebar_job_mode",
+        )
+        job_file = st.text_input(
+            "File path (in uploads/)",
+            placeholder="uploads/example.pdf",
+            key="sidebar_job_file",
+        )
+        job_user = st.text_input(
+            "Your name (for audit)",
+            value=os.environ.get("USER", os.environ.get("USERNAME", "user")),
+            key="sidebar_job_user",
+        )
+
+        if st.button("Submit as Background Job", key="sidebar_submit_job"):
+            if not job_file:
+                st.warning("Enter a file path.")
+            else:
+                try:
+                    job_id = job_manager.submit(
+                        job_type="uc1.extract",
+                        params={"file_path": job_file, "mode": job_mode, "lang": "mr"},
+                        user=job_user,
+                    )
+                    st.success(f"Job submitted: `{job_id}`")
+                except Exception as exc:
+                    st.error(f"Failed: {exc}")
+
+        # Show recent jobs
+        st.divider()
+        st.markdown("### Recent Jobs")
+        try:
+            recent = job_manager.list_jobs(job_type="uc1.extract", limit=5)
+            for j in recent:
+                status_icon = {
+                    "completed": "+", "failed": "-", "running": "~",
+                    "pending": ".", "cancelled": "x",
+                }.get(j["status"], "?")
+                st.markdown(
+                    f"`[{status_icon}]` **{j['status']}** {j['progress']}% "
+                    f"— {j.get('progress_message', '')[:40]}"
+                )
+        except Exception:
+            st.caption("Could not load recent jobs.")
+
+
 def main():
     st.set_page_config(
         page_title="DocExtract — Land Record OCR",
@@ -1904,6 +1983,9 @@ def main():
     if not api_key:
         st.warning("**CXAI_API_KEY** not found in `.env`. Vision and Combined modes require this key.")
 
+    # Render background job sidebar
+    _render_job_sidebar()
+
     mode = st.radio(
         "Processing Mode",
         ["Single Document", "Batch Processing"],
@@ -1912,6 +1994,9 @@ def main():
     )
 
     st.divider()
+
+    if _HAS_JOB_SYSTEM:
+        audit_log("uc1.page_loaded", user=os.environ.get("USER", "unknown"))
 
     if mode == "Single Document":
         _single_mode(api_key)
