@@ -1,0 +1,96 @@
+DIGILEKHA — Post-Testing Changes
+=================================
+Track changes to implement after completing the first full manual test pass.
+
+
+[1] UC1 Quality Step — Before/After Enhancement Preview
+-------------------------------------------------------
+WHERE: ui/views/uc1.py, lib/config.py, .env
+DONE:
+  - Auto-enhance reads file from disk (no memory loss on step nav)
+  - Side-by-side: Original vs Enhanced with quality scores + deltas
+  - Enhancement params from .env: ENHANCE_CONTRAST=1.3, ENHANCE_BRIGHTNESS=1.05,
+    ENHANCE_DENOISE=nlm, ENHANCE_DESKEW=true, ENHANCE_ADAPTIVE_THRESH=false
+  - Smooth progress bar for extraction (interpolates between server updates)
+STATUS: COMPLETED
+
+
+[2] UC1 Upload Step — Merge upload + quality into one step
+-----------------------------------------------------------
+WHERE: ui/views/uc1.py
+DONE:
+  - Combined upload + quality into single step 0 ("Upload & Quality")
+  - Auto-upload on file selection (no separate upload button)
+  - Quality enhancement in same step with before/after comparison
+  - Wizard reduced from 5 steps to 4: Upload+Quality > Extract > Semantic > Output
+  - All _mark_done() indices shifted accordingly
+STATUS: COMPLETED
+
+
+[3] UC1 Output Step — Show individual pipeline results before merged
+-------------------------------------------------------------------
+WHERE: ui/views/uc1.py, usecase1_land_record_ocr.py
+DONE:
+  - Added paddle_extraction and vision_extraction to extraction engine result dict
+  - Output step now shows 4 tabs: Merged | PaddleOCR | GPT Vision | Semantic
+  - PaddleOCR tab: raw OCR text + structured fields per page
+  - Vision tab: raw Vision API response text
+  - Each tab shows pipeline status, timing, and source info
+STATUS: COMPLETED
+
+
+[4] UC2 Batch — Replace local folder scan with cloud upload UI
+--------------------------------------------------------------
+WHERE: ui/views/uc2.py (_batch_pdfs function)
+DONE:
+  - Removed local folder scan text input and Scan Folder button
+  - Added styled drag-and-drop upload area with cloud provider badges
+    (Google Drive, Dropbox, OneDrive, Local Files)
+  - Clean upload-only flow; badges show Day-2 integration vision
+STATUS: COMPLETED
+
+
+[5] Field App — Smart quality gate based on input method
+--------------------------------------------------------
+WHERE: ui/views/mobile_demo.py
+DONE:
+  - Added _run_local_quality_gate() that runs QualityChecker + ImageEnhancer locally
+  - Camera: check → enhance → recheck → retake if still fails
+  - File upload: check → enhance → always proceed (never shows retake)
+  - PDFs skip quality gate entirely (extraction pipeline handles internally)
+  - Enhanced image bytes replace original before upload to server
+  - Works both online and offline
+STATUS: COMPLETED
+
+
+[6] UC2 — Admin-configurable verification criteria
+---------------------------------------------------
+WHERE: api/routers/uc2.py, usecase2_photo_verification.py, ui/views/settings.py
+DONE:
+  - MongoDB collection "uc2_criteria" with 6 default built-in criteria
+  - API endpoints: GET/POST/DELETE /api/uc2/criteria
+  - SceneAnalyzer dynamically builds GPT Vision prompt from active criteria
+  - Custom criteria injected as "ADDITIONAL VERIFICATION CRITERIA" in system prompt
+  - Settings page: view all criteria, add custom, remove custom (built-ins protected)
+  - TrainingPhotoVerifier loads custom criteria from DB at runtime
+STATUS: COMPLETED
+
+
+[7] WhatsApp tunnel — replace ngrok with working alternative
+-------------------------------------------------------------
+WHERE: dev.ps1
+DONE:
+  - Updated dev.ps1 WhatsApp setup instructions with 3 tunnel options:
+    A: cloudflared tunnel --url http://localhost:8000
+    B: npx localtunnel --port 8000
+    C: ngrok http 8000 (fallback)
+  - User must test which tunnel works on their network
+  - Set Twilio Sandbox webhook to generated tunnel URL + /api/whatsapp/webhook
+STATUS: COMPLETED
+
+
+[8] (add more items below as testing reveals them)
+---------------------------------------------------
+WHERE:
+WHAT:
+STATUS: PENDING
