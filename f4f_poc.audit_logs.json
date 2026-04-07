@@ -1,0 +1,111 @@
+[{
+  "_id": {
+    "$oid": "69d4f7b7c6670dc5d6af7ae5"
+  },
+  "action": "file.uploaded",
+  "user": "vmandlik",
+  "timestamp": {
+    "$date": "2026-04-07T12:25:27.755Z"
+  },
+  "level": "info",
+  "job_id": null,
+  "detail": {
+    "filename": "training_photo.jpg",
+    "dest": "C:\\Users\\vmandlik\\Downloads\\test01\\uploads\\20260407_122527_a5dbdd9e_training_photo.jpg",
+    "size_bytes": 983091,
+    "file_id": "d432b298bb7b8574"
+  },
+  "result": {}
+},
+{
+  "_id": {
+    "$oid": "69d4f7d9c6670dc5d6af7ae7"
+  },
+  "action": "file.uploaded",
+  "user": "vmandlik",
+  "timestamp": {
+    "$date": "2026-04-07T12:26:01.507Z"
+  },
+  "level": "info",
+  "job_id": null,
+  "detail": {
+    "filename": "test.pdf",
+    "dest": "C:\\Users\\vmandlik\\Downloads\\test01\\uploads\\20260407_122601_460e5320_test.pdf",
+    "size_bytes": 88439,
+    "file_id": "365df0b89074a3e8"
+  },
+  "result": {}
+},
+{
+  "_id": {
+    "$oid": "69d4f7dbc6670dc5d6af7ae9"
+  },
+  "action": "job.created",
+  "user": "vmandlik",
+  "timestamp": {
+    "$date": "2026-04-07T12:26:03.583Z"
+  },
+  "level": "info",
+  "job_id": "69d4f7dbc6670dc5d6af7ae8",
+  "detail": {
+    "job_type": "uc1.extract",
+    "params": {
+      "file_path": "C:\\Users\\vmandlik\\Downloads\\test01\\uploads\\20260407_122601_460e5320_test.pdf",
+      "mode": "paddle",
+      "lang": "mr"
+    },
+    "tags": [
+      "field_app"
+    ]
+  },
+  "result": {}
+},
+{
+  "_id": {
+    "$oid": "69d4f7dbc6670dc5d6af7aea"
+  },
+  "action": "api.uc1.extract_submitted",
+  "user": "vmandlik",
+  "timestamp": {
+    "$date": "2026-04-07T12:26:03.585Z"
+  },
+  "level": "info",
+  "job_id": "69d4f7dbc6670dc5d6af7ae8",
+  "detail": {
+    "file_path": "C:\\Users\\vmandlik\\Downloads\\test01\\uploads\\20260407_122601_460e5320_test.pdf",
+    "mode": "paddle"
+  },
+  "result": {}
+},
+{
+  "_id": {
+    "$oid": "69d4f7dbc6670dc5d6af7aeb"
+  },
+  "action": "job.started",
+  "user": "system",
+  "timestamp": {
+    "$date": "2026-04-07T12:26:03.586Z"
+  },
+  "level": "info",
+  "job_id": "69d4f7dbc6670dc5d6af7ae8",
+  "detail": {
+    "job_type": "uc1.extract"
+  },
+  "result": {}
+},
+{
+  "_id": {
+    "$oid": "69d4f80ec6670dc5d6af7aec"
+  },
+  "action": "job.completed",
+  "user": "system",
+  "timestamp": {
+    "$date": "2026-04-07T12:26:54.882Z"
+  },
+  "level": "info",
+  "job_id": "69d4f7dbc6670dc5d6af7ae8",
+  "detail": {},
+  "result": {
+    "summary": "status=ok, keys=['status', 'source_file', 'extraction_mode', 'merged_extraction', 'timing_seconds']"
+  }
+}]

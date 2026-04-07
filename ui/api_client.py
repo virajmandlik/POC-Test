@@ -87,7 +87,7 @@ def upload_files(file_objs: list, user: str = "ui") -> list[dict]:
 # ─────────────────────────────────────────────────────────────────────
 
 
-@st.cache_data(ttl=10)
+# @st.cache_data(ttl=10)
 def health() -> dict | None:
     return get("/api/health")
 

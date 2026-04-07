@@ -360,23 +360,45 @@ def _step_verdict():
 
 def _batch_pdfs():
     section_divider()
-    col_up, col_folder = st.columns(2)
 
-    with col_up:
-        st.markdown("#### Upload PDFs")
-        batch_files = st.file_uploader(
-            "Upload CC training PDFs", type=["pdf"],
-            accept_multiple_files=True, key="uc2_batch_up",
-        )
-    with col_folder:
-        st.markdown("#### Or scan a local folder")
-        folder = st.text_input(
-            "Folder path containing PDFs",
-            value="cc_data_final",
-            help="Relative or absolute path to a folder with CC training PDFs",
-            key="uc2_folder",
-        )
-        scan = st.button("Scan Folder", key="uc2_scan")
+    import streamlit.components.v1 as components
+    _BATCH_HTML = """
+    <div style="background:#F1F8E9;border:2px solid #C8E6C9;border-radius:16px;padding:24px;margin-bottom:16px;">
+      <div style="text-align:center;margin-bottom:16px;">
+        <span style="font-size:2rem;">🌾</span>
+        <div style="font-weight:700;font-size:1.1rem;color:#1B3A1B;margin-top:4px;">Digilekha Batch Upload</div>
+        <div style="color:#5D7A5D;font-size:0.8rem;">Upload training PDFs from any source</div>
+      </div>
+      <div style="display:flex;justify-content:center;gap:24px;flex-wrap:wrap;">
+        <div style="text-align:center;opacity:0.6;">
+          <img src="https://www.google.com/favicon.ico" width="28" height="28" style="border-radius:6px;"/>
+          <div style="font-size:0.7rem;color:#5D7A5D;margin-top:4px;">Google Drive</div>
+          <div style="font-size:0.6rem;color:#999;">Coming Soon</div>
+        </div>
+        <div style="text-align:center;opacity:0.6;">
+          <img src="https://www.dropbox.com/static/30168/images/favicon.ico" width="28" height="28" style="border-radius:6px;"/>
+          <div style="font-size:0.7rem;color:#5D7A5D;margin-top:4px;">Dropbox</div>
+          <div style="font-size:0.6rem;color:#999;">Coming Soon</div>
+        </div>
+        <div style="text-align:center;opacity:0.6;">
+          <img src="https://www.microsoft.com/favicon.ico" width="28" height="28" style="border-radius:6px;"/>
+          <div style="font-size:0.7rem;color:#5D7A5D;margin-top:4px;">OneDrive</div>
+          <div style="font-size:0.6rem;color:#999;">Coming Soon</div>
+        </div>
+        <div style="text-align:center;">
+          <div style="width:28px;height:28px;background:#2E7D32;border-radius:6px;display:inline-flex;align-items:center;justify-content:center;color:white;font-size:16px;">📁</div>
+          <div style="font-size:0.7rem;color:#2E7D32;margin-top:4px;font-weight:600;">Local Upload</div>
+          <div style="font-size:0.6rem;color:#2E7D32;">Active ✓</div>
+        </div>
+      </div>
+    </div>
+    """
+    components.html(_BATCH_HTML, height=200)
+
+    batch_files = st.file_uploader(
+        "Upload CC training PDFs", type=["pdf"],
+        accept_multiple_files=True, key="uc2_batch_up",
+    )
 
     file_paths: list[str] = []
     if batch_files:
@@ -384,16 +406,8 @@ def _batch_pdfs():
             file_paths = [r["path"] for r in api.upload_files(batch_files, st.session_state.get("username", "ui"))]
             st.success(f"{len(file_paths)} PDFs uploaded")
 
-    if scan and folder:
-        p = Path(folder)
-        if p.is_dir():
-            file_paths = sorted(str(f) for f in p.iterdir() if f.suffix.lower() == ".pdf")
-            st.success(f"Found {len(file_paths)} PDFs")
-        else:
-            st.error(f"Not found: {folder}")
-
     if not file_paths:
-        st.info("Upload PDFs or scan a folder to begin.")
+        st.info("Upload PDFs to begin batch verification.")
         return
 
     st.markdown(f"**{len(file_paths)}** PDFs ready for processing")

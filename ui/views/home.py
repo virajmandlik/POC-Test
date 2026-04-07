@@ -3,6 +3,7 @@ Home / Dashboard — friendly overview with short metric labels.
 """
 
 from datetime import datetime
+from pathlib import Path
 
 import pandas as pd
 import streamlit as st
@@ -71,6 +72,45 @@ def render():
             for jt in h.get("registered_job_types", []):
                 icon = "📄" if "uc1" in jt else "🌳" if "uc2" in jt else "⚙️"
                 st.caption(f"{icon}  `{jt}`")
+
+    section_divider()
+
+    # ── Offline Sync Queue ────────────────────────────────
+    st.markdown("##### Offline Sync Queue")
+    sync_data = api.get("/api/sync/status", timeout=5)
+    if sync_data and isinstance(sync_data, dict):
+        sc1, sc2, sc3, sc4 = st.columns(4)
+        sc1.metric("Pending", sync_data.get("pending", 0))
+        sc2.metric("Synced", sync_data.get("synced", 0))
+        sc3.metric("Failed", sync_data.get("failed", 0))
+        online_data = api.get("/api/sync/online", timeout=5)
+        is_online = online_data.get("online", False) if online_data else False
+        sc4.metric("VPN/Internet", "🟢 Online" if is_online else "🔴 Offline")
+
+        recent_synced = api.get("/api/sync/recent", params={"limit": 5}, timeout=5)
+        if recent_synced and isinstance(recent_synced, dict):
+            items = recent_synced.get("items", [])
+            if items:
+                st.markdown("**Recent Synced Results:**")
+                for item in items:
+                    jt = item.get("job_type", "").upper()
+                    fp = Path(item.get("file_path", "")).name if item.get("file_path") else "—"
+                    synced_at = _relative_time(item.get("synced_at"))
+                    st.caption(f"🔄 **{jt}** — `{fp}` — synced {synced_at}")
+
+                    combined = item.get("combined_result", {})
+                    if combined and isinstance(combined, dict):
+                        if jt == "UC1":
+                            merged = combined.get("merged_extraction", {})
+                            if merged:
+                                village = merged.get("village", "—")
+                                survey = merged.get("survey_number", "—")
+                                st.markdown(f"  Survey: {survey} | Village: {village}")
+                        elif jt == "UC2":
+                            decision = combined.get("decision", "—")
+                            st.markdown(f"  Verdict: **{decision}**")
+    else:
+        st.caption("Sync queue not available")
 
     section_divider()
 

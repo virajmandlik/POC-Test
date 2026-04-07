@@ -43,14 +43,21 @@ logging.basicConfig(
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup: register job types, connect DB.  Shutdown: drain workers."""
-    log.info("Starting F4F API server...")
+    log.info("Starting Digilekha API server...")
     register_all_job_types()
     get_db()  # force connection + index creation
     log.info("Registered job types: %s", get_registered_types())
-    log.info("F4F API ready — http://0.0.0.0:%s", os.environ.get("API_PORT", "8000"))
+
+    from lib.connectivity_monitor import start as start_monitor
+    start_monitor()
+    log.info("Connectivity monitor started")
+
+    log.info("Digilekha API ready — http://0.0.0.0:%s", os.environ.get("API_PORT", "8000"))
 
     yield
 
+    from lib.connectivity_monitor import stop as stop_monitor
+    stop_monitor()
     log.info("Shutting down — draining job workers...")
     job_manager.shutdown()
     log.info("Shutdown complete.")
@@ -62,14 +69,14 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="F4F POC API",
+    title="Digilekha API",
     description=(
-        "Farmers for Forests — Document Automation API.\n\n"
+        "Digilekha — Digital Land Records & Field Verification API.\n\n"
         "**UC1:** Land Record OCR & Extraction (Maharashtra 7/12 documents)\n\n"
         "**UC2:** Carbon Credit Training Photo Verification\n\n"
         "Submit jobs, poll for results, query audit logs."
     ),
-    version="0.1.0",
+    version="0.2.0",
     lifespan=lifespan,
 )
 
@@ -89,7 +96,7 @@ app.add_middleware(
 # ═══════════════════════════════════════════════════════════════════════
 
 
-from api.routers import upload, jobs, uc1, uc2, audit, whatsapp  # noqa: E402
+from api.routers import upload, jobs, uc1, uc2, audit, whatsapp, sync  # noqa: E402
 
 app.include_router(upload.router)
 app.include_router(jobs.router)
@@ -97,6 +104,7 @@ app.include_router(uc1.router)
 app.include_router(uc2.router)
 app.include_router(audit.router)
 app.include_router(whatsapp.router)
+app.include_router(sync.router)
 
 
 # ═══════════════════════════════════════════════════════════════════════

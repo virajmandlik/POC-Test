@@ -21,14 +21,15 @@ load_dotenv()
 
 from ui import api_client as api
 from ui.theme import inject_css, sidebar_brand
-from ui.views import home, uc1, uc2, jobs, audit, settings
+from ui.views import home, uc1, uc2, jobs, audit, settings, mobile_demo
 
 # ─── Page Registry ────────────────────────────────────────────────────
 
 PAGES = [
     ("📊  Dashboard",           home),
     ("📄  Land Records",        uc1),
-    ("🌳  Photo Verification",  uc2),
+    ("🌿  Photo Verification",  uc2),
+    ("📱  Field App",           mobile_demo),
     ("⚡  Jobs",                jobs),
     ("📋  Audit Logs",          audit),
     ("⚙️  Settings",            settings),
@@ -37,8 +38,8 @@ PAGES = [
 
 def main():
     st.set_page_config(
-        page_title="Farmers for Forests",
-        page_icon="🌳",
+        page_title="Digilekha",
+        page_icon="🌾",
         layout="wide",
         initial_sidebar_state="expanded",
     )
