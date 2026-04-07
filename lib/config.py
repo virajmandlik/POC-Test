@@ -60,6 +60,23 @@ class Config:
         default_factory=lambda: int(os.environ.get("JOB_WORKER_THREADS", "2"))
     )
 
+    # ── Image Enhancement ─────────────────────────────────────
+    ENHANCE_CONTRAST: float = field(
+        default_factory=lambda: float(os.environ.get("ENHANCE_CONTRAST", "1.3"))
+    )
+    ENHANCE_BRIGHTNESS: float = field(
+        default_factory=lambda: float(os.environ.get("ENHANCE_BRIGHTNESS", "1.05"))
+    )
+    ENHANCE_DENOISE: str = field(
+        default_factory=lambda: os.environ.get("ENHANCE_DENOISE", "nlm")
+    )
+    ENHANCE_DESKEW: bool = field(
+        default_factory=lambda: os.environ.get("ENHANCE_DESKEW", "true").lower() == "true"
+    )
+    ENHANCE_ADAPTIVE_THRESH: bool = field(
+        default_factory=lambda: os.environ.get("ENHANCE_ADAPTIVE_THRESH", "false").lower() == "true"
+    )
+
     # ── Platform ─────────────────────────────────────────────────
     PLATFORM: str = field(default_factory=lambda: platform.system().lower())
 

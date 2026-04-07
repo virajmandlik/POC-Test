@@ -461,6 +461,27 @@ def _batch_pdfs():
         _render_batch_results(batch_result)
 
 
+def _get_photo_bytes(photo_path: str, pdf_file: str) -> bytes | None:
+    """Get photo bytes from saved file or extract from PDF on-the-fly."""
+    if photo_path and Path(photo_path).exists():
+        return Path(photo_path).read_bytes()
+
+    if pdf_file and Path(pdf_file).exists() and pdf_file.lower().endswith(".pdf"):
+        try:
+            import pypdfium2 as pdfium
+            doc = pdfium.PdfDocument(pdf_file)
+            page_idx = min(2, len(doc) - 1)
+            bitmap = doc[page_idx].render(scale=2.0)
+            img = bitmap.to_pil().convert("RGB")
+            buf = io.BytesIO()
+            img.save(buf, format="JPEG", quality=90)
+            return buf.getvalue()
+        except Exception:
+            return None
+
+    return None
+
+
 def _render_batch_results(result: dict):
     """Render batch results with summary, filtering, table, CSV download,
     and individual result inspection with images."""
@@ -545,62 +566,76 @@ def _render_batch_results(result: dict):
         label = f"[{icon}] {lid or fname} — {decision}"
 
         with st.expander(label):
+            photo_path = item.get("photo_path", "")
             data = item.get("data", {})
-            if isinstance(data, dict) and data:
-                checks = data.get("checks", {})
+            pdf_file = item.get("file", "")
 
-                qc = checks.get("image_quality", {})
-                if qc:
-                    qc_details = {k: v for k, v in qc.items()
-                                  if k not in ("passed", "reason") and v is not None}
-                    _check_card("Image Quality", qc.get("passed", False), qc_details, qc.get("reason", ""))
+            # Try saved photo, else extract from PDF on-the-fly
+            photo_bytes = _get_photo_bytes(photo_path, pdf_file)
 
-                scene = checks.get("scene_analysis", {})
-                if scene:
-                    scene_details = {}
-                    for k in ("people_count", "has_multiple_people", "has_representative",
-                               "is_training_scene", "is_outdoor_rural", "confidence"):
-                        if k in scene:
-                            scene_details[k] = scene[k]
-                    _check_card("Scene Analysis", scene.get("passed", False), scene_details, scene.get("reason", ""))
+            if photo_bytes:
+                col_img, col_checks = st.columns([1, 2])
+                with col_img:
+                    st.image(photo_bytes, caption=f"Extracted from {fname}", use_container_width=True)
+            else:
+                col_checks = st.container()
 
-                    desc = scene.get("scene_description", "")
-                    if desc:
-                        st.markdown(f"**Description:** {desc}")
+            with col_checks:
+                if isinstance(data, dict) and data:
+                    checks = data.get("checks", {})
 
-                meta = checks.get("metadata", {})
-                if meta:
-                    meta_details = {}
-                    gps = meta.get("gps")
-                    if gps and isinstance(gps, dict):
-                        meta_details["GPS Lat"] = gps.get("lat")
-                        meta_details["GPS Lon"] = gps.get("lon")
-                    ts = meta.get("timestamp")
-                    if ts:
-                        meta_details["Timestamp"] = ts
-                    _check_card("Metadata", meta.get("passed", False), meta_details, meta.get("reason", ""))
+                    qc = checks.get("image_quality", {})
+                    if qc:
+                        qc_details = {k: v for k, v in qc.items()
+                                      if k not in ("passed", "reason") and v is not None}
+                        _check_card("Image Quality", qc.get("passed", False), qc_details, qc.get("reason", ""))
 
-                    if gps and gps.get("lat") is not None and gps.get("lon") is not None:
-                        try:
-                            lat = float(gps["lat"])
-                            lon = float(gps["lon"])
-                            map_df = pd.DataFrame({"lat": [lat], "lon": [lon]})
-                            st.map(map_df, zoom=10)
-                        except (ValueError, TypeError):
-                            pass
+                    scene = checks.get("scene_analysis", {})
+                    if scene:
+                        scene_details = {}
+                        for k in ("people_count", "has_multiple_people", "has_representative",
+                                   "is_training_scene", "is_outdoor_rural", "confidence"):
+                            if k in scene:
+                                scene_details[k] = scene[k]
+                        _check_card("Scene Analysis", scene.get("passed", False), scene_details, scene.get("reason", ""))
 
-                reasons = data.get("rejection_reasons", [])
-                if reasons:
-                    st.markdown("**Rejection Reasons:**")
-                    for r in reasons:
-                        st.markdown(f"- {r}")
+                        desc = scene.get("scene_description", "")
+                        if desc:
+                            st.markdown(f"**Description:** {desc}")
 
-                ms = data.get("metadata", {}).get("processing_time_ms", 0)
-                if ms:
-                    st.caption(f"Processing time: {ms} ms")
+                    meta = checks.get("metadata", {})
+                    if meta:
+                        meta_details = {}
+                        gps = meta.get("gps")
+                        if gps and isinstance(gps, dict):
+                            meta_details["GPS Lat"] = gps.get("lat")
+                            meta_details["GPS Lon"] = gps.get("lon")
+                        ts = meta.get("timestamp")
+                        if ts:
+                            meta_details["Timestamp"] = ts
+                        _check_card("Metadata", meta.get("passed", False), meta_details, meta.get("reason", ""))
 
-                with st.expander("Raw JSON"):
-                    st.json(data)
+                        if gps and gps.get("lat") is not None and gps.get("lon") is not None:
+                            try:
+                                lat = float(gps["lat"])
+                                lon = float(gps["lon"])
+                                map_df = pd.DataFrame({"lat": [lat], "lon": [lon]})
+                                st.map(map_df, zoom=10)
+                            except (ValueError, TypeError):
+                                pass
+
+                    reasons = data.get("rejection_reasons", [])
+                    if reasons:
+                        st.markdown("**Rejection Reasons:**")
+                        for r in reasons:
+                            st.markdown(f"- {r}")
+
+                    ms = data.get("metadata", {}).get("processing_time_ms", 0)
+                    if ms:
+                        st.caption(f"Processing time: {ms} ms")
+
+                    with st.expander("Raw JSON"):
+                        st.json(data)
 
             if item.get("error"):
                 st.error(item["error"])

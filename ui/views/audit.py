@@ -21,7 +21,7 @@ def render():
         with fc1:
             log_action = st.text_input("Action (regex)", key="audit_action")
         with fc2:
-            log_user = st.text_input("User", key="audit_user")
+            log_user = st.text_input("User", value="", key="audit_user", placeholder="all users")
         with fc3:
             log_level = st.selectbox("Level", ["All", "info", "warn", "error"], key="audit_level")
         with fc4:
@@ -29,7 +29,7 @@ def render():
 
         dc1, dc2 = st.columns(2)
         with dc1:
-            log_since = st.date_input("Since", value=datetime.now() - timedelta(days=7), key="audit_since")
+            log_since = st.date_input("Since", value=datetime.now() - timedelta(days=30), key="audit_since")
         with dc2:
             log_until = st.date_input("Until", value=datetime.now(), key="audit_until")
 
@@ -43,7 +43,8 @@ def render():
     if log_since:
         params["since"] = log_since.isoformat()
     if log_until:
-        params["until"] = log_until.isoformat()
+        # Include the full "Until" day by pushing to end-of-day
+        params["until"] = (datetime.combine(log_until, datetime.max.time())).isoformat()
 
     data = api.get_audit_logs(**params)
     if not data:

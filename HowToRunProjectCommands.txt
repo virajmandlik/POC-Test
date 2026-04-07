@@ -1,0 +1,5 @@
+terminal 1 : 
+streamlit run ui/app.py --server.port 8502
+
+terminal 2:
+ python -m uvicorn api.app:app --host 0.0.0.0 --port 8000

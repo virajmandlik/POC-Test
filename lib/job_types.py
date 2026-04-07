@@ -159,12 +159,20 @@ def _uc2_batch(job_id: str, **params: Any) -> dict:
         ids = PDFIdentifiers.from_filename(pdf_path.name)
         try:
             img = extractor.extract_photo(pdf_path)
+
+            # Save extracted photo for UI display
+            photo_dir = cfg.OUTPUT_DIR / "verified"
+            photo_dir.mkdir(parents=True, exist_ok=True)
+            photo_path = photo_dir / f"{pdf_path.stem}_photo.jpg"
+            img.save(str(photo_path), format="JPEG", quality=90)
+
             vresult = verifier.verify(img=img, skip_vision=False)
             results.append({
                 "file": str(pdf_path),
                 "lid": ids.lid if ids else "",
                 "decision": vresult.decision,
                 "data": vresult.to_dict(),
+                "photo_path": str(photo_path),
             })
         except Exception as exc:
             results.append({

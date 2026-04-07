@@ -1,15 +1,13 @@
 """
 UC1 — Land Record OCR & Extraction (stepper wizard).
 
-Steps:  Upload → Quality → Extract → Semantic → Output
+Steps:  Upload & Quality → Extract → Semantic → Output
 Each step has Back/Next navigation with colour-coded progress.
 
-Rich semantic view includes:
-  - Land Summary metrics
-  - Original Owner info
-  - Ownership & Encumbrance Graphviz chart
-  - Current Owners / Encumbrances / Water Resources tables
-  - Key Dates
+Changes from CHANGES_TODO [1][2][3]:
+  - Merged Upload + Quality into single step with auto-enhance before/after
+  - Enhancement params read from .env via lib/config
+  - Output shows 4 tabs: Merged | PaddleOCR | GPT Vision | Semantic
 """
 
 import io
@@ -23,9 +21,23 @@ import streamlit as st
 from ui import api_client as api
 from ui.theme import page_header, section_divider, stepper, step_nav
 
-_STEPS = ["Upload", "Quality", "Extract", "Semantic", "Output"]
+_STEPS_FULL = ["Upload & Quality", "Extract", "Semantic", "Output"]
+_STEPS_OFFLINE = ["Upload & Quality", "Extract", "Output"]
 _SS = "uc1_step"
 _DONE = "uc1_done"
+
+
+def _get_steps() -> list[str]:
+    """Semantic step requires VPN/internet — skip it in paddle-only mode."""
+    ext_mode = st.session_state.get("uc1_mode_locked", "combined")
+    return _STEPS_OFFLINE if ext_mode == "paddle" else _STEPS_FULL
+
+
+def _get_step_handlers() -> list:
+    ext_mode = st.session_state.get("uc1_mode_locked", "combined")
+    if ext_mode == "paddle":
+        return [_step_upload_quality, _step_extract, _step_output]
+    return [_step_upload_quality, _step_extract, _step_semantic, _step_output]
 
 
 def render():
@@ -47,18 +59,19 @@ def render():
     if _DONE not in st.session_state:
         st.session_state[_DONE] = set()
 
-    cur = st.session_state[_SS]
+    steps = _get_steps()
+    handlers = _get_step_handlers()
+    cur = min(st.session_state[_SS], len(steps) - 1)
     done = st.session_state[_DONE]
 
-    stepper(_STEPS, cur, done)
-
-    [_step_upload, _step_quality, _step_extract, _step_semantic, _step_output][cur]()
+    stepper(steps, cur, done)
+    handlers[cur]()
 
     section_divider()
     new = step_nav(
-        cur, len(_STEPS), "uc1",
+        cur, len(steps), "uc1",
         next_disabled=_next_disabled(cur),
-        next_label=_next_label(cur),
+        next_label=_next_label(cur, steps),
     )
     if new is not None:
         st.session_state[_SS] = new
@@ -68,14 +81,16 @@ def render():
 def _next_disabled(cur: int) -> bool:
     if cur == 0:
         return "uc1_file_path" not in st.session_state
-    if cur == 2:
+    if cur == 1:
         return "uc1_result" not in st.session_state
     return False
 
 
-def _next_label(cur: int) -> str:
-    labels = {0: "Quality →", 1: "Extract →", 2: "Semantic →", 3: "Output →"}
-    return labels.get(cur, "Next →")
+def _next_label(cur: int, steps: list[str] | None = None) -> str:
+    steps = steps or _get_steps()
+    if cur + 1 < len(steps):
+        return f"{steps[cur + 1]} →"
+    return "Next →"
 
 
 def _mark_done(step: int):
@@ -83,11 +98,11 @@ def _mark_done(step: int):
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# STEP 0 — Upload
+# STEP 0 — Upload & Quality (merged)
 # ═══════════════════════════════════════════════════════════════════════
 
-def _step_upload():
-    st.markdown("### Upload Document")
+def _step_upload_quality():
+    st.markdown("### Upload & Quality Check")
     col_up, col_opts = st.columns([3, 1])
 
     with col_up:
@@ -97,105 +112,220 @@ def _step_upload():
             key="uc1_upload",
         )
     with col_opts:
-        st.selectbox(
+        mode_options = ["combined", "paddle", "vision"]
+        saved_mode = st.session_state.get("uc1_mode_locked")
+        default_idx = mode_options.index(saved_mode) if saved_mode in mode_options else 0
+
+        selected_mode = st.selectbox(
             "Extraction mode",
-            ["combined", "paddle", "vision"],
+            mode_options,
+            index=default_idx,
             format_func=lambda m: {"combined": "Combined (best)", "paddle": "PaddleOCR", "vision": "GPT-4 Vision"}[m],
             key="uc1_extract_mode",
         )
-        st.selectbox("Language", ["mr", "hi", "en"], key="uc1_lang")
+        # Persist mode outside of widget key so it survives step navigation
+        st.session_state["uc1_mode_locked"] = selected_mode
+
+        lang_options = ["mr", "hi", "en"]
+        saved_lang = st.session_state.get("uc1_lang_locked", "mr")
+        lang_idx = lang_options.index(saved_lang) if saved_lang in lang_options else 0
+        selected_lang = st.selectbox("Language", lang_options, index=lang_idx, key="uc1_lang")
+        st.session_state["uc1_lang_locked"] = selected_lang
 
     if uploaded:
-        if uploaded.type == "application/pdf":
-            st.info(f"**{uploaded.name}** — {uploaded.size / 1024:.1f} KB")
-        else:
-            st.image(uploaded, caption=uploaded.name, width=480)
+        is_new_file = st.session_state.get("uc1_file_name") != uploaded.name
 
-        if st.button("Upload to Server", type="primary", key="uc1_do_upload"):
+        # Auto-upload + auto-quality on file selection
+        if "uc1_file_path" not in st.session_state or is_new_file:
+            if is_new_file:
+                # Clear previous quality results when file changes
+                for k in ["uc1_quality_done", "uc1_original_report", "uc1_enhanced_report",
+                           "uc1_original_bytes", "uc1_enhanced_bytes", "uc1_is_pdf_render"]:
+                    st.session_state.pop(k, None)
+
             with st.spinner("Uploading…"):
                 uploaded.seek(0)
                 res = api.upload_file(uploaded, user=st.session_state.get("username", "ui"))
             if res:
                 st.session_state["uc1_file_path"] = res["path"]
                 st.session_state["uc1_file_name"] = res["filename"]
-                _mark_done(0)
-                st.success(f"**{res['filename']}** uploaded — click **Quality →** to continue")
             else:
                 st.error("Upload failed")
+                return
+
+        # Auto-run quality check + enhancement (no manual button)
+        if "uc1_quality_done" not in st.session_state:
+            _run_quality_enhancement()
+        else:
+            _show_quality_results()
 
     if "uc1_file_path" in st.session_state:
         st.caption(f"File ready: `{st.session_state.get('uc1_file_name', '')}`")
+        _mark_done(0)
 
 
-# ═══════════════════════════════════════════════════════════════════════
-# STEP 1 — Quality Check
-# ═══════════════════════════════════════════════════════════════════════
+def _compute_adaptive_params(report) -> dict:
+    """Adapt enhancement params based on quality check results instead of blindly applying .env defaults."""
+    from lib.config import cfg
 
-def _step_quality():
-    st.markdown("### Quality Check")
+    brightness = report.get("mean_brightness", 128)
+    contrast = report.get("contrast_ratio", 0.3)
+    blur = report.get("blur_score", 200)
+
+    # Brightness: pull toward ideal range (100-160)
+    if brightness > 200:
+        bright_factor = max(0.75, 1.0 - (brightness - 160) / 400)
+    elif brightness < 80:
+        bright_factor = min(1.25, 1.0 + (80 - brightness) / 300)
+    else:
+        bright_factor = 1.0
+
+    # Contrast: only boost if actually low
+    if contrast < 0.2:
+        contrast_factor = min(cfg.ENHANCE_CONTRAST, 1.4)
+    elif contrast < 0.3:
+        contrast_factor = min(cfg.ENHANCE_CONTRAST, 1.2)
+    else:
+        contrast_factor = 1.0
+
+    return {
+        "contrast": contrast_factor,
+        "brightness": bright_factor,
+        "denoise_method": cfg.ENHANCE_DENOISE if blur < 150 else "none",
+        "deskew": cfg.ENHANCE_DESKEW,
+        "adaptive_thresh": cfg.ENHANCE_ADAPTIVE_THRESH,
+    }
+
+
+def _run_quality_enhancement():
     fp = st.session_state.get("uc1_file_path")
     if not fp:
-        st.warning("Upload a document first (step 1).")
         return
 
-    st.caption(f"File: `{st.session_state.get('uc1_file_name', fp)}`")
+    p = Path(fp)
+    if not p.exists():
+        return
 
-    uploaded = st.session_state.get("uc1_upload")
-    if uploaded and st.button("Run Quality Gate", type="primary", key="uc1_qc_run"):
-        with st.spinner("Analysing…"):
-            uploaded.seek(0)
-            try:
-                import requests
-                r = requests.post(
-                    f"{api.API_URL}/api/uc1/quality-check",
-                    files={"file": (uploaded.name, uploaded.getvalue(), uploaded.type)},
-                    params={"user": st.session_state.get("username", "ui")},
-                    timeout=30,
-                )
-                r.raise_for_status()
-                qc = r.json()
-            except Exception as exc:
-                st.error(f"Failed: {exc}")
+    with st.spinner("Analysing document quality…"):
+        from PIL import Image
+        from usecase1_land_record_ocr import QualityChecker, ImageEnhancer
+
+        is_pdf = p.suffix.lower() == ".pdf"
+        if is_pdf:
+            import pypdfium2 as pdfium
+            pdf_doc = pdfium.PdfDocument(str(p))
+            if len(pdf_doc) == 0:
+                st.error("PDF has no pages")
                 return
-
-        st.session_state["uc1_qc"] = qc
-        _mark_done(1)
-
-    qc = st.session_state.get("uc1_qc")
-    if qc:
-        passed = qc.get("gate_passed", qc.get("passed", False))
-        if passed:
-            st.success("Quality gate **PASSED**")
+            bitmap = pdf_doc[0].render(scale=2.0)
+            img = bitmap.to_pil()
+            st.session_state["uc1_is_pdf_render"] = True
         else:
-            reasons = qc.get("gate_reasons") or qc.get("issues") or []
-            st.warning("Quality gate **FAILED**")
-            for r in reasons:
-                st.markdown(f"- {r}")
+            img = Image.open(fp)
+            st.session_state["uc1_is_pdf_render"] = False
 
-        mc = st.columns(5)
-        mc[0].metric("Width", qc.get("width", 0))
-        mc[1].metric("Height", qc.get("height", 0))
-        mc[2].metric("Sharp", qc.get("sharpness", "—"))
-        mc[3].metric("Bright", f"{qc.get('mean_brightness', 0):.0f}")
-        mc[4].metric("Contrast", f"{qc.get('contrast_ratio', 0):.2f}")
+        if img.mode == "RGBA":
+            img = img.convert("RGB")
 
-        extra = st.columns(4)
-        if qc.get("orientation"):
-            extra[0].metric("Orientation", qc["orientation"])
-        if qc.get("text_density_pct") is not None:
-            extra[1].metric("Text Density", f"{qc['text_density_pct']:.1f}%")
-        if qc.get("skew_angle_deg") is not None:
-            extra[2].metric("Skew", f"{qc['skew_angle_deg']:.2f}°")
-        if qc.get("readability"):
-            extra[3].metric("Readability", qc["readability"])
+        checker = QualityChecker()
+        enhancer = ImageEnhancer()
 
-    elif not uploaded:
-        st.info("The uploaded file is no longer in memory. You can skip to Extract or re-upload.")
-        _mark_done(1)
+        original_report = checker.check(img)
+        orig_dict = original_report.__dict__ if hasattr(original_report, '__dict__') else vars(original_report)
+        st.session_state["uc1_original_report"] = orig_dict
+
+        # Adaptive enhancement — adjust params based on current image state
+        params = _compute_adaptive_params(orig_dict)
+        st.session_state["uc1_enhance_params"] = params
+
+        enhanced_img = enhancer.enhance(
+            img,
+            contrast=params["contrast"],
+            brightness=params["brightness"],
+            denoise_method=params["denoise_method"],
+            deskew=params["deskew"],
+            adaptive_thresh=params["adaptive_thresh"],
+        )
+
+        enhanced_report = checker.check(enhanced_img)
+        st.session_state["uc1_enhanced_report"] = enhanced_report.__dict__ if hasattr(enhanced_report, '__dict__') else vars(enhanced_report)
+
+        orig_buf = io.BytesIO()
+        img.save(orig_buf, format="JPEG", quality=92)
+        st.session_state["uc1_original_bytes"] = orig_buf.getvalue()
+
+        enh_buf = io.BytesIO()
+        enhanced_img.save(enh_buf, format="JPEG", quality=92)
+        st.session_state["uc1_enhanced_bytes"] = enh_buf.getvalue()
+        st.session_state["uc1_quality_done"] = True
+        st.rerun()
+
+
+def _show_quality_results():
+    orig = st.session_state.get("uc1_original_report", {})
+    enh = st.session_state.get("uc1_enhanced_report", {})
+
+    if not orig or not enh:
+        return
+
+    is_pdf = st.session_state.get("uc1_is_pdf_render", False)
+    if is_pdf:
+        st.caption("PDF page 1 rendered at 2× scale for quality analysis")
+
+    col_orig, col_enh = st.columns(2)
+
+    with col_orig:
+        st.markdown("**Original**")
+        orig_bytes = st.session_state.get("uc1_original_bytes")
+        if orig_bytes:
+            st.image(orig_bytes, width=350)
+        mc = st.columns(3)
+        mc[0].metric("Blur", f"{orig.get('blur_score', 0):.0f}")
+        mc[1].metric("Bright", f"{orig.get('mean_brightness', 0):.0f}")
+        mc[2].metric("Contrast", f"{orig.get('contrast_ratio', 0):.3f}")
+        issues = orig.get("issues", [])
+        if issues:
+            for iss in issues:
+                st.caption(f"⚠️ {iss}")
+        else:
+            st.caption("✅ All checks passed")
+
+    with col_enh:
+        st.markdown("**Enhanced** (auto)")
+        enh_bytes = st.session_state.get("uc1_enhanced_bytes")
+        if enh_bytes:
+            st.image(enh_bytes, width=350)
+        mc = st.columns(3)
+
+        blur_delta = enh.get("blur_score", 0) - orig.get("blur_score", 0)
+        bright_delta = enh.get("mean_brightness", 0) - orig.get("mean_brightness", 0)
+        contrast_delta = enh.get("contrast_ratio", 0) - orig.get("contrast_ratio", 0)
+
+        mc[0].metric("Blur", f"{enh.get('blur_score', 0):.0f}", delta=f"{blur_delta:+.0f}")
+        mc[1].metric("Bright", f"{enh.get('mean_brightness', 0):.0f}", delta=f"{bright_delta:+.0f}")
+        mc[2].metric("Contrast", f"{enh.get('contrast_ratio', 0):.3f}", delta=f"{contrast_delta:+.3f}")
+        enh_issues = enh.get("issues", [])
+        if enh_issues:
+            for iss in enh_issues:
+                st.caption(f"⚠️ {iss}")
+        else:
+            st.caption("✅ All checks passed")
+
+    params = st.session_state.get("uc1_enhance_params", {})
+    with st.expander("Enhancement Parameters (adaptive)"):
+        st.markdown(
+            f"- Contrast: `{params.get('contrast', '—')}` | "
+            f"Brightness: `{params.get('brightness', '—')}`"
+        )
+        st.markdown(
+            f"- Denoise: `{params.get('denoise_method', '—')}` | "
+            f"Deskew: `{params.get('deskew', '—')}`"
+        )
+        st.caption("Parameters auto-adjusted based on document quality analysis")
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# STEP 2 — Extract
+# STEP 1 — Extract
 # ═══════════════════════════════════════════════════════════════════════
 
 def _step_extract():
@@ -205,30 +335,44 @@ def _step_extract():
         st.warning("Upload a document first.")
         return
 
-    st.caption(f"File: `{st.session_state.get('uc1_file_name', fp)}`  ·  "
-               f"Mode: `{st.session_state.get('uc1_extract_mode', 'combined')}`")
+    mode = st.session_state.get("uc1_mode_locked", "combined")
+    lang = st.session_state.get("uc1_lang_locked", "mr")
+    mode_label = {"combined": "Combined", "paddle": "PaddleOCR", "vision": "GPT-4 Vision"}.get(mode, mode)
+    st.caption(f"File: `{st.session_state.get('uc1_file_name', fp)}`  ·  Mode: `{mode_label}`")
 
     if st.button("Run Extraction", type="primary", key="uc1_run_ext"):
-        mode = st.session_state.get("uc1_extract_mode", "combined")
-        lang = st.session_state.get("uc1_lang", "mr")
         user = st.session_state.get("username", "ui")
 
-        with st.status("Running extraction…", expanded=True) as status:
-            resp = api.submit_job("/api/uc1/extract", {
-                "file_path": fp, "mode": mode, "lang": lang,
-                "user": user, "tags": ["ui", "single"],
-            })
-            if not resp:
-                st.error("Submission failed")
-                return
-            job_id = resp["job_id"]
-            st.write(f"Job `{job_id}` submitted")
+        resp = api.submit_job("/api/uc1/extract", {
+            "file_path": fp, "mode": mode, "lang": lang,
+            "user": user, "tags": ["ui", "single"],
+        })
+        if not resp:
+            st.error("Submission failed")
+            return
+        job_id = resp["job_id"]
 
-            job = _poll(job_id, status)
+        prog = st.progress(0, text="Extracting…")
+        start = time.time()
+        last_pct = 0
+        while time.time() - start < 300:
+            job = api.get_job(job_id)
+            if not job:
+                break
+            server_pct = min(job.get("progress", 0), 100)
+            if server_pct > last_pct:
+                last_pct = server_pct
+            else:
+                last_pct = min(last_pct + 1, 95)
+            prog.progress(last_pct / 100, text=f"Extracting… {last_pct}%")
+            if job["status"] in ("completed", "failed", "cancelled"):
+                break
+            time.sleep(1.5)
+        prog.progress(1.0, text="Done")
 
         if job and job.get("status") == "completed":
             st.session_state["uc1_result"] = job.get("result", {})
-            _mark_done(2)
+            _mark_done(1)
             st.success("Extraction complete!")
         elif job:
             st.error(f"Job {job.get('status')}: {job.get('error', '')}")
@@ -240,15 +384,8 @@ def _step_extract():
 
 
 def _render_extraction_summary(result: dict):
-    """Render a structured summary of the extraction result."""
     merged = result.get("merged_extraction", result)
-    timing = result.get("timing_seconds", {})
     pipeline = result.get("pipeline", {})
-
-    if timing:
-        tc = st.columns(min(len(timing), 4))
-        for i, (k, v) in enumerate(timing.items()):
-            tc[i % len(tc)].metric(k.replace("_", " ").title(), f"{v:.1f}s")
 
     if pipeline:
         pc = st.columns(len(pipeline))
@@ -299,47 +436,26 @@ def _render_extraction_summary(result: dict):
             if owner_rows:
                 st.dataframe(pd.DataFrame(owner_rows), use_container_width=True, hide_index=True)
 
-        area = merged.get("area", {})
-        if isinstance(area, dict) and area.get("total_area_hectare"):
-            st.markdown("#### Area Details")
-            ac = st.columns(4)
-            ac[0].metric("Total Area", f"{area.get('total_area_hectare', '—')} ha")
-            cultivable = area.get("cultivable", {})
-            if isinstance(cultivable, dict):
-                ac[1].metric("Jirayat", f"{cultivable.get('jirayat_hectare', '—')} ha")
-                ac[2].metric("Bagayat", f"{cultivable.get('bagayat_hectare', '—')} ha")
-            ac[3].metric("Pot Kharab", f"{area.get('pot_kharab_hectare', '—')} ha")
-
-        encumbrances = merged.get("encumbrances", [])
-        if isinstance(encumbrances, list) and encumbrances:
-            st.markdown("#### Encumbrances")
-            enc_rows = []
-            for e in encumbrances:
-                if isinstance(e, dict):
-                    enc_rows.append({
-                        "Type": e.get("type", ""),
-                        "Bank": e.get("bank_name", ""),
-                        "Branch": e.get("branch", ""),
-                        "Amount (Rs)": e.get("amount_rupees", ""),
-                        "Borrower": e.get("borrower_name", ""),
-                        "Mutation Ref": e.get("mutation_ref", ""),
-                    })
-            if enc_rows:
-                st.dataframe(pd.DataFrame(enc_rows), use_container_width=True, hide_index=True)
-
     with st.expander("View Full Extracted JSON"):
         st.json(merged)
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# STEP 3 — Semantic Analysis
+# STEP 2 — Semantic Analysis
 # ═══════════════════════════════════════════════════════════════════════
 
 def _step_semantic():
     st.markdown("### Semantic Analysis & Knowledge Graph")
+
+    ext_mode = st.session_state.get("uc1_mode_locked", "combined")
+    if ext_mode == "paddle":
+        st.warning("Semantic analysis requires internet/VPN (GPT-4o-mini). "
+                    "Switch to Combined mode or skip to Output.")
+        return
+
     result = st.session_state.get("uc1_result")
     if not result:
-        st.warning("Run extraction first (step 3).")
+        st.warning("Run extraction first (step 2).")
         return
 
     st.markdown(
@@ -363,7 +479,7 @@ def _step_semantic():
         if job and job.get("status") == "completed":
             sem = job.get("result", {})
             st.session_state["uc1_semantic"] = sem
-            _mark_done(3)
+            _mark_done(2)
         elif job:
             st.error(f"Job {job.get('status')}: {job.get('error', '')}")
 
@@ -374,14 +490,7 @@ def _step_semantic():
         _render_semantic_view(semantic_data)
 
 
-# ═══════════════════════════════════════════════════════════════════════
-# SEMANTIC VIEW — full knowledge graph visualization
-# ═══════════════════════════════════════════════════════════════════════
-
 def _render_semantic_view(semantic: dict):
-    """Render the full semantic knowledge graph visualization with
-    land summary, ownership chain, Graphviz graph, encumbrances,
-    water resources, and key dates."""
     if "raw_llm_response" in semantic:
         st.warning("Semantic analysis returned non-JSON.")
         st.code(semantic["raw_llm_response"])
@@ -445,15 +554,6 @@ def _render_semantic_view(semantic: dict):
         ]
         st.dataframe(pd.DataFrame(enc_rows), use_container_width=True, hide_index=True)
 
-    wells = semantic.get("wells", [])
-    if wells:
-        st.markdown("#### Water Resources")
-        for w in wells:
-            st.markdown(
-                f"- Well owned by **{w.get('owner', '—')}** "
-                f"(Mutation: {w.get('mutation_ref', '—')})"
-            )
-
     dates = semantic.get("key_dates", {})
     if dates and any(dates.values()):
         st.markdown("#### Key Dates")
@@ -467,7 +567,6 @@ def _render_semantic_view(semantic: dict):
 
 
 def _build_ownership_dot(semantic: dict) -> str:
-    """Build a Graphviz DOT string for the ownership knowledge graph."""
     summary = semantic.get("land_summary", {})
     original = semantic.get("original_owner", {})
     chain = semantic.get("ownership_chain", [])
@@ -602,7 +701,86 @@ def _build_ownership_dot(semantic: dict) -> str:
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# STEP 4 — Final Output
+# TAB RENDERERS — PaddleOCR / Vision individual results
+# ═══════════════════════════════════════════════════════════════════════
+
+def _render_paddle_tab(paddle_data: dict):
+    pages = paddle_data.get("pages", [])
+    if pages:
+        for pg in pages:
+            idx = pg.get("page_index", 0)
+            st.markdown(f"**Page {idx + 1}**")
+            text = pg.get("combined_text", "")
+            if text:
+                st.text_area("Raw OCR Text", text, height=250, key=f"paddle_raw_{idx}")
+            sf = pg.get("structured_fields", {})
+            if sf:
+                st.markdown("**Structured Fields:**")
+                st.json(sf)
+            stats = pg.get("stats", {})
+            if stats:
+                sc = st.columns(4)
+                sc[0].metric("Text Blocks", stats.get("total_text_blocks", "—"))
+                sc[1].metric("Corrected", stats.get("corrected_blocks", "—"))
+                sc[2].metric("Low Confidence", stats.get("low_confidence_blocks", "—"))
+                sc[3].metric("Avg Confidence", f"{stats.get('avg_confidence', 0):.2%}")
+    else:
+        st.json(paddle_data)
+
+
+def _render_paddle_fallback(result: dict):
+    """Load raw PaddleOCR data only — no cross-pollination from merged result."""
+    from lib.config import cfg
+    ocr_file = cfg.OUTPUT_DIR / "ocr_output.json"
+    if ocr_file.exists():
+        try:
+            ocr_data = json.loads(ocr_file.read_text(encoding="utf-8"))
+            if ocr_data and isinstance(ocr_data, dict):
+                st.caption("Raw PaddleOCR output (local OCR engine)")
+                _render_paddle_tab(ocr_data)
+                return
+        except Exception:
+            pass
+
+    st.info("PaddleOCR raw data not available. Re-run extraction to generate.")
+
+
+def _render_vision_tab(vision_data: dict):
+    content = vision_data.get("extracted_content", "")
+    if content:
+        try:
+            parsed = json.loads(content)
+            st.json(parsed)
+        except (json.JSONDecodeError, TypeError):
+            st.text_area("Vision API Response", content, height=300, key="vision_raw_content")
+    else:
+        st.json(vision_data)
+
+
+def _render_vision_fallback(result: dict):
+    """Load raw Vision data only — no cross-pollination from merged result."""
+    mode = st.session_state.get("uc1_mode_locked", "combined")
+    if mode == "paddle":
+        st.info("Vision API was not used (PaddleOCR-only mode).")
+        return
+
+    from lib.config import cfg
+    vision_file = cfg.OUTPUT_DIR / "vision_output.json"
+    if vision_file.exists():
+        try:
+            vision_data = json.loads(vision_file.read_text(encoding="utf-8"))
+            if vision_data and isinstance(vision_data, dict):
+                st.caption("Raw GPT-4 Vision output (cloud API)")
+                _render_vision_tab(vision_data)
+                return
+        except Exception:
+            pass
+
+    st.info("GPT-4 Vision raw data not available. Re-run extraction to generate.")
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# STEP 3 — Final Output (4 tabs)
 # ═══════════════════════════════════════════════════════════════════════
 
 def _step_output():
@@ -612,62 +790,77 @@ def _step_output():
         st.warning("Run extraction first.")
         return
 
-    _mark_done(4)
+    _mark_done(3)
 
-    final = {
-        "extraction": result,
-        "semantic": st.session_state.get("uc1_semantic"),
-        "metadata": {
-            "file": st.session_state.get("uc1_file_name", ""),
-            "mode": st.session_state.get("uc1_extract_mode", ""),
-        },
-    }
+    tab_merged, tab_paddle, tab_vision, tab_semantic = st.tabs(
+        ["📊 Merged (Final)", "🔤 PaddleOCR", "👁️ GPT Vision", "🧠 Semantic"]
+    )
 
     merged = result.get("merged_extraction", {})
-    sem = st.session_state.get("uc1_semantic", {})
-    sem_data = sem.get("semantic_knowledge_graph", sem) if sem else {}
+    pipeline = result.get("pipeline", {})
 
-    col_l, col_r = st.columns(2)
-    with col_l:
-        st.markdown("#### Extraction Summary")
-        if isinstance(merged, dict):
-            summary_items = {
-                "Document Type": merged.get("document_type", "—"),
-                "Report Date": merged.get("report_date", "—"),
-                "District": merged.get("district", "—"),
-                "Taluka": merged.get("taluka", "—"),
-                "Village": merged.get("village", "—"),
-                "Survey No.": merged.get("survey_number", "—"),
-            }
-            for k, v in summary_items.items():
-                st.markdown(f"- **{k}:** {v}")
-
-    with col_r:
-        st.markdown("#### Semantic Summary")
-        if sem_data:
-            land = sem_data.get("land_summary", {})
-            st.markdown(f"- **Total Area:** {land.get('total_area_hectare', '—')} ha")
-            st.markdown(f"- **Tenure:** {land.get('tenure_type', '—')}")
-            owners = sem_data.get("current_owners", [])
-            st.markdown(f"- **Current Owners:** {len(owners)}")
-            enc = sem_data.get("encumbrances_mapped", [])
-            st.markdown(f"- **Encumbrances:** {len(enc)}")
+    with tab_merged:
+        st.markdown("#### Combined Extraction Result")
+        if isinstance(merged, dict) and merged:
+            _render_extraction_summary(result)
         else:
-            st.caption("No semantic analysis run yet")
+            st.info("No merged extraction available")
 
-    section_divider()
+        final = {
+            "extraction": result,
+            "semantic": st.session_state.get("uc1_semantic"),
+            "metadata": {
+                "file": st.session_state.get("uc1_file_name", ""),
+                "mode": st.session_state.get("uc1_mode_locked", ""),
+            },
+        }
+        section_divider()
+        json_bytes = json.dumps(final, indent=2, default=str, ensure_ascii=False)
+        st.download_button(
+            "📥 Download Full JSON",
+            data=json_bytes,
+            file_name="uc1_output.json",
+            mime="application/json",
+            type="primary",
+        )
 
-    with st.expander("View Full JSON Output"):
-        st.json(final)
+    with tab_paddle:
+        st.markdown("#### PaddleOCR Extraction")
+        paddle_info = pipeline.get("paddleocr", {})
+        if paddle_info:
+            pc = st.columns(2)
+            pc[0].metric("Status", paddle_info.get("status", "—"))
+            pc[1].metric("Time", f"{paddle_info.get('elapsed_seconds', 0):.1f}s")
 
-    json_bytes = json.dumps(final, indent=2, default=str, ensure_ascii=False)
-    st.download_button(
-        "Download JSON",
-        data=json_bytes,
-        file_name="uc1_output.json",
-        mime="application/json",
-        type="primary",
-    )
+        paddle_data = result.get("paddle_extraction")
+        if paddle_data and isinstance(paddle_data, dict):
+            _render_paddle_tab(paddle_data)
+        else:
+            # Fallback: reconstruct from merged_extraction or saved output file
+            _render_paddle_fallback(result)
+
+    with tab_vision:
+        st.markdown("#### GPT-4 Vision Extraction")
+        vision_info = pipeline.get("vision_api", {})
+        if vision_info:
+            vc = st.columns(2)
+            vc[0].metric("Status", vision_info.get("status", "—"))
+            vc[1].metric("Time", f"{vision_info.get('elapsed_seconds', 0):.1f}s")
+
+        vision_data = result.get("vision_extraction")
+        if vision_data:
+            _render_vision_tab(vision_data)
+        else:
+            _render_vision_fallback(result)
+
+    with tab_semantic:
+        st.markdown("#### Semantic Analysis")
+        sem = st.session_state.get("uc1_semantic")
+        if sem:
+            semantic_data = sem.get("semantic_knowledge_graph", sem)
+            _render_semantic_view(semantic_data)
+        else:
+            st.info("Run semantic analysis in step 3 first.")
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -676,16 +869,10 @@ def _step_output():
 
 def _batch_processing():
     section_divider()
-    col_up, col_folder = st.columns(2)
-
-    with col_up:
-        batch_files = st.file_uploader(
-            "Upload PDFs / images", type=["pdf", "png", "jpg", "jpeg"],
-            accept_multiple_files=True, key="uc1_batch_up",
-        )
-    with col_folder:
-        folder = st.text_input("Or scan a folder", value="uploads", key="uc1_folder")
-        scan = st.button("Scan", key="uc1_scan")
+    batch_files = st.file_uploader(
+        "Upload PDFs / images", type=["pdf", "png", "jpg", "jpeg"],
+        accept_multiple_files=True, key="uc1_batch_up",
+    )
 
     mode = st.radio(
         "Extraction", ["combined", "paddle", "vision"], horizontal=True,
@@ -699,23 +886,15 @@ def _batch_processing():
             file_paths = [r["path"] for r in api.upload_files(batch_files, st.session_state.get("username", "ui"))]
             st.success(f"{len(file_paths)} files uploaded")
 
-    if scan and folder:
-        p = Path(folder)
-        if p.is_dir():
-            file_paths = sorted(str(f) for f in p.iterdir() if f.suffix.lower() in (".pdf", ".png", ".jpg", ".jpeg"))
-            st.success(f"Found {len(file_paths)} docs")
-        else:
-            st.error(f"Not found: {folder}")
-
     if not file_paths:
-        st.info("Upload files or scan a folder to begin.")
+        st.info("Upload files to begin.")
         return
 
     st.markdown(f"**{len(file_paths)}** documents ready")
     if st.button("Process All", type="primary", key="uc1_batch_go", use_container_width=True):
         resp = api.submit_job("/api/uc1/batch", {
             "file_paths": file_paths, "mode": mode,
-            "lang": st.session_state.get("uc1_lang", "mr"),
+            "lang": st.session_state.get("uc1_lang_locked", "mr"),
             "user": st.session_state.get("username", "ui"),
             "tags": ["ui", "batch"],
         })
@@ -762,8 +941,6 @@ def _batch_processing():
 
 
 def _render_batch_results(result: dict):
-    """Render batch results with summary metrics, table, CSV download,
-    and individual result inspection with semantic analysis."""
     if not result:
         return
 
@@ -783,7 +960,7 @@ def _render_batch_results(result: dict):
         csv_buf = io.StringIO()
         df.to_csv(csv_buf, index=False)
         st.download_button(
-            "Download Results CSV",
+            "📥 Download Results CSV",
             data=csv_buf.getvalue(),
             file_name="uc1_batch_results.csv",
             mime="text/csv",
@@ -792,71 +969,6 @@ def _render_batch_results(result: dict):
     else:
         with st.expander("View Raw Result"):
             st.json(result)
-
-    output_path = result.get("output_path")
-    if output_path:
-        try:
-            p = Path(output_path)
-            if p.exists():
-                with p.open("r", encoding="utf-8") as f:
-                    batch_details = json.load(f)
-
-                if isinstance(batch_details, list):
-                    section_divider()
-                    st.subheader("Inspect Individual Results")
-                    for idx, item in enumerate(batch_details):
-                        fname = Path(item.get("file", f"doc_{idx}")).name
-                        status = item.get("status", "unknown")
-                        icon = "+" if status == "ok" else "-"
-
-                        with st.expander(f"[{icon}] {fname} — {status}"):
-                            data = item.get("data", {})
-                            merged = data.get("merged_extraction", data) if isinstance(data, dict) else data
-
-                            view_tab, graph_tab = st.tabs(["Extracted Data", "Semantic Graph"])
-
-                            with view_tab:
-                                if isinstance(merged, dict):
-                                    _render_extraction_summary(data if isinstance(data, dict) else {"merged_extraction": merged})
-                                else:
-                                    st.json(merged)
-
-                            with graph_tab:
-                                sem_key = f"batch_sem_{idx}"
-                                if sem_key not in st.session_state:
-                                    st.session_state[sem_key] = None
-
-                                if st.button(
-                                    "Run Semantic Analysis",
-                                    key=f"batch_sem_btn_{idx}",
-                                    use_container_width=True,
-                                ):
-                                    user = st.session_state.get("username", "ui")
-                                    extraction_data = merged if isinstance(merged, dict) else {}
-                                    sem_resp = api.submit_job("/api/uc1/semantic", {
-                                        "extraction_data": extraction_data,
-                                        "user": user,
-                                        "tags": ["ui", "batch-semantic"],
-                                    })
-                                    if sem_resp:
-                                        with st.spinner("Building knowledge graph…"):
-                                            sem_job = api.poll_job(sem_resp["job_id"], timeout=120)
-                                        if sem_job and sem_job.get("status") == "completed":
-                                            sem_result = sem_job.get("result", {})
-                                            st.session_state[sem_key] = sem_result.get("semantic_knowledge_graph", sem_result)
-                                            st.success("Semantic analysis complete")
-                                        elif sem_job:
-                                            st.error(f"Failed: {sem_job.get('error', '')}")
-                                    else:
-                                        st.error("Submission failed")
-
-                                if st.session_state[sem_key]:
-                                    _render_semantic_view(st.session_state[sem_key])
-
-                            if item.get("error"):
-                                st.error(item["error"])
-        except Exception:
-            pass
 
 
 # ═══════════════════════════════════════════════════════════════════════

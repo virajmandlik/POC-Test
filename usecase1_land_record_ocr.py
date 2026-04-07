@@ -710,6 +710,14 @@ class ExtractionEngine:
             with ocr_out.open("r", encoding="utf-8") as f:
                 ocr_data = json.load(f)
 
+        # Persist raw vision output for UI tabs
+        if vision_ok and vision_content:
+            try:
+                with vision_out_path.open("w", encoding="utf-8") as vf:
+                    json.dump({"extracted_content": vision_content}, vf, ensure_ascii=False, indent=2)
+            except Exception:
+                pass
+
         ocr_text = ""
         if ocr_data.get("pages"):
             page = ocr_data["pages"][0]
@@ -787,6 +795,8 @@ class ExtractionEngine:
                 "gpt4o_mini_merge": {"elapsed_seconds": round(t_gpt, 2), "usage": gpt_resp.get("usage", {})},
             },
             "merged_extraction": validated,
+            "paddle_extraction": ocr_data if paddle_ok else None,
+            "vision_extraction": {"extracted_content": vision_content} if vision_ok else None,
             "timing_seconds": {
                 "parallel_extraction": round(t_parallel, 2),
                 "gpt_merge": round(t_gpt, 2),
