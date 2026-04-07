@@ -69,15 +69,21 @@ def _process_pending():
 
 
 def _sync_uc1(file_path: str, paddle_result: dict) -> dict:
+    from pathlib import Path
     from usecase1_land_record_ocr import ExtractionEngine
     engine = ExtractionEngine()
-    return engine.extract(file_path, mode="combined", lang="mr", paddle_result=paddle_result)
+    return engine.extract(Path(file_path), mode="combined", lang="mr")
 
 
 def _sync_uc2(file_path: str) -> dict:
+    from PIL import Image
     from usecase2_photo_verification import TrainingPhotoVerifier
     verifier = TrainingPhotoVerifier()
-    return verifier.verify(file_path, skip_vision=False)
+    img = Image.open(file_path)
+    if img.mode == "RGBA":
+        img = img.convert("RGB")
+    result = verifier.verify(img, skip_vision=False)
+    return result.to_dict()
 
 
 def _monitor_loop():
